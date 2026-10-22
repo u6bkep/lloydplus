@@ -204,15 +204,17 @@ class LloydPlus:
         c = self.control
         if c is not None:
             if c.take_attempted and not self.lost.is_set():
-                # separately: a failed stop must not skip the release
+                # separately: a failed stop must not skip the release.  Catch
+                # BaseException: a Ctrl+C here must not leave the machine
+                # driving or under our control.
                 try:
                     c.stop(timeout=2.0)
-                except Exception as e:
-                    log.warning("could not stop before closing: %s", e)
+                except BaseException as e:
+                    log.warning("could not stop before closing: %r", e)
                 try:
                     c.release_control(timeout=5.0)
-                except Exception as e:
-                    log.warning("could not release control before closing: %s", e)
+                except BaseException as e:
+                    log.warning("could not release control before closing: %r", e)
             c.close()
             self.control = None
         if self._watchdog:

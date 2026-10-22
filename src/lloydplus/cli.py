@@ -191,6 +191,21 @@ def _take_control(args, m) -> None:
     m.control.take_control(tensile_limit=tensile, compressive_limit=compressive)
 
 
+def _interruptible_stop(m, seg=None) -> None:
+    """Stop on Ctrl+C.  A terminal delivers SIGINT to the whole foreground
+    group, so a second KeyboardInterrupt can arrive while we wait for the
+    machine; keep stopping rather than unwinding through it."""
+    for _ in range(5):
+        try:
+            print("stopping", file=sys.stderr)
+            m.control.stop()
+            if seg is not None:
+                seg.wait(1.0)
+            return
+        except KeyboardInterrupt:
+            continue
+
+
 def _readings(m) -> str:
     load, ext = m.load, m.extension
     return (f"load {load:10.3f} N   extension {ext:10.4f} mm"
@@ -213,9 +228,7 @@ def cmd_move(args) -> int:
             while not seg.wait(0.5):
                 print(_readings(m), flush=True)
         except KeyboardInterrupt:
-            print("stopping", file=sys.stderr)
-            m.control.stop()
-            seg.wait(1.0)
+            _interruptible_stop(m, seg)
         print(f"done ({seg.reason}): {_readings(m)}")
     finally:
         m.close()           # stops and releases control
@@ -245,7 +258,7 @@ def cmd_home(args) -> int:
                 print(_readings(m), flush=True)
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            m.control.stop()
+            _interruptible_stop(m)
         print(_readings(m))
     finally:
         m.close()
