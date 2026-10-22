@@ -613,15 +613,21 @@ than read are marked **(inferred)**.
 * **Two 32-entry tables** in `StageArenaReference5` decide what runs next:
   * `next[i]`: where the machine goes when the stage in slot i **completes** by
     itself (e.g. the limit is reached).
-  * `active[i]`: a **redirect**. When the table is written and the current slot i
-    has `active[i] != i`, the machine leaves i for `active[i]` at once, whether or not
-    the stage has completed. `active[i] == i` means "no redirect" **(inferred** from
-    how the console writes the table: every bulk write keeps `active[i] = i` for slots
-    it must not disturb, and Stop is a write of `active[running slots] = 7`).
-  * The redirect is applied **when written, not re-checked when a slot is entered**
-    **(inferred)**. Zero writes `active[7] = 9`, and slot 9's `next` is 7. If entry
-    re-checked `active`, the machine would loop 7 → 9 → 7 forever; ReturnToZero would
-    loop through 10 the same way.
+  * `active[i]`: a **redirect**. When a write covers the current slot i and sets
+    `active[i] != i`, the machine leaves i for `active[i]` at once, whether or not the
+    stage has completed. `active[i] == i` means "no redirect" **(inferred** from how
+    the console writes the table: every bulk write keeps `active[i] = i` for slots it
+    must not disturb, and Stop is a write of `active[running slots] = 7`).
+  * The redirect is checked **only for the slots the packet writes**, and **not
+    re-checked when a slot is entered** **(inferred**; the console's own traffic would
+    misbehave otherwise):
+    * Zero writes `active[7] = 9`, and slot 9's `next` is 7. If entering a slot
+      re-checked `active`, the machine would loop 7 → 9 → 7 forever; ReturnToZero
+      would loop through 10 the same way.
+    * Release writes `active[7] = 8` and nothing resets it. A later take-control
+      writes `active[3] = 0` while the machine is already in 7. If every write
+      re-checked the current slot, that would bounce the machine straight back out of
+      control on every test after the first.
 * **Reports.** The machine reports every slot change `(old, new)` to the PC. Nothing
   else in the stage subsystem flows machine → PC.
 * **Done on the PC, not the machine:** hold timing (§11.6), break detection (§11.7),
@@ -955,6 +961,15 @@ Independently, leaving slot 11 (`old == 11`) hides the cancel-return dialog.
   flow, and the extension-source ranging check at connect (§11.4 step 5).
 * **Stage setup is opt-in for `info` / `log`.** The CLI's read-only commands connect
   with `control=False`, so they still send only handshake and query traffic.
+* **Re-taking control.** Calling `take_control` while already in control first stops.
+  With the same settings it then returns. With different protection settings it
+  releases and takes control again, so the new grip limits really are sent.
+* **Timeouts and link loss.** `drive()` stops the machine before raising on timeout.
+  A link reset or watchdog timeout ends all segments with reason "link lost" and wakes
+  every waiting call.
+* **Connect order.** Permanent stages are sent as each factory opens, in the console's
+  open order. The `next`/`active` writes come after the mandatory factories. The
+  optional factories are opened afterwards; the console opens them concurrently.
 
 ## 12. Console messages relevant to the link
 

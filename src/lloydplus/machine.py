@@ -96,6 +96,8 @@ class LloydPlus:
         log.error("machine restarted the link; connection lost")
         self.mux.reset()
         self.lost.set()
+        if self.control is not None:
+            self.control.on_lost()
 
     def _on_message(self, msg: svc.MachineMessage) -> None:
         self.messages.append(msg)
@@ -185,6 +187,8 @@ class LloydPlus:
 
     def _on_watchdog_timeout(self) -> None:
         self.lost.set()
+        if self.control is not None:
+            self.control.on_lost()
 
     def start_stream(self) -> None:
         if self._stream is None:
@@ -197,14 +201,19 @@ class LloydPlus:
 
     def close(self) -> None:
         """Disconnect.  If the PC has control, stop and hand control back first."""
-        if self.control is not None:
-            try:
-                if self.control.in_control:
-                    self.control.stop(timeout=2.0)
-                    self.control.release_control(timeout=5.0)
-            except Exception as e:
-                log.warning("could not stop/release before closing: %s", e)
-            self.control.close()
+        c = self.control
+        if c is not None:
+            if c.take_attempted and not self.lost.is_set():
+                # separately: a failed stop must not skip the release
+                try:
+                    c.stop(timeout=2.0)
+                except Exception as e:
+                    log.warning("could not stop before closing: %s", e)
+                try:
+                    c.release_control(timeout=5.0)
+                except Exception as e:
+                    log.warning("could not release control before closing: %s", e)
+            c.close()
             self.control = None
         if self._watchdog:
             self._watchdog.stop()

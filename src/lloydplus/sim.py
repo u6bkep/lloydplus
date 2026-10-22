@@ -229,7 +229,9 @@ class SimMachine:
         count, start, values = p[1], p[2], p[3:]
         table = self.active if p[0] == 1 else self.next
         table[start:start + count] = list(values)
-        if p[0] == 1 and self.active[self.current] != self.current:
+        # a redirect is checked only for the slots this packet wrote (PROTOCOL.md §11.1)
+        if (p[0] == 1 and start <= self.current < start + count
+                and self.active[self.current] != self.current):
             self._goto(self.active[self.current])
 
     # -- services ---------------------------------------------------------

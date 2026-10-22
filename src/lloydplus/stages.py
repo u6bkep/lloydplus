@@ -18,6 +18,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -201,6 +202,15 @@ class StageArena(ServiceClient):
             with self._cv:
                 self._cv.notify_all()
 
+    def _on_remote_close(self) -> None:
+        self.lost()
+
+    def lost(self) -> None:
+        """The notification channel is gone: wake every waiter."""
+        self.closed.set()
+        with self._cv:
+            self._cv.notify_all()
+
     def _write(self, kind: int, start: int, values: bytes) -> None:
         values = bytes(values)
         if not values or start < 0 or start + len(values) > ARENA_SLOTS:
@@ -348,6 +358,8 @@ class StageControl:
     * if GainExclusive fails (slot 0), :meth:`take_control` re-arms
       ``active[0] = 2`` so the machine returns to the wait loop.
     * TrueStrainRate stages are not offered: the rate's unit is unresolved.
+
+    See PROTOCOL.md §11.9 for the full list.
     """
 
     def __init__(self, mux: ChannelMux, *, min_speed: float, max_speed: float,
@@ -362,7 +374,10 @@ class StageControl:
         self.missing: dict[str, ServiceOpenError] = {}
         self._lock = threading.RLock()
         self._bank_flag = False            # wrapper+0x1b0: False -> 16, True -> 12
-        self._segments: list[Segment] = []
+        self._pending: deque[Segment] = deque()   # started, not yet entered (cf. +0x1a4)
+        self._running: Segment | None = None
+        self.take_attempted = False
+        self._taken_with: tuple | None = None
         self.arena = StageArena(mux, timeout)
         self.arena.listeners.append(self._on_transition)
         try:
@@ -374,35 +389,58 @@ class StageControl:
     # -- connect ----------------------------------------------------------
 
     def _install(self, sources: list[int]) -> None:
+        # Each permanent stage is sent as soon as its factory opens, in the
+        # console's open order (open-reply handler 0x426020).
+        ext = self._ext_source()
+        permanent = {
+            WAIT_SHARED: [bytes((SLOT_WAIT_SHARED,))],
+            WAIT_EXCLUSIVE: [bytes((SLOT_WAIT_EXCLUSIVE,))],
+            GAIN_EXCLUSIVE: [bytes((SLOT_GAIN_EXCLUSIVE,))],
+            RELEASE_EXCLUSIVE: [bytes((SLOT_RELEASE_EXCLUSIVE,))],
+            CROSSHEAD_POSITIONING: [motion_stage(s, self.max_speed, ext, 0.0)
+                                    for s in (SLOT_RETURN, SLOT_RETURN_RELEASE)],
+            DRIVE_NOWHERE: [bytes((SLOT_STOP_A,)), bytes((SLOT_STOP_B,))],
+            ZERO_READINGS: [zero_readings_stage(SLOT_ZERO, sources)],
+        }
         for name in MANDATORY_FACTORIES:
-            self.factories[name] = ServiceClient(self.mux, name, timeout=self.timeout)
+            svc = self.factories[name] = ServiceClient(self.mux, name, timeout=self.timeout)
+            for packet in permanent.get(name, ()):
+                svc.send(packet)
+        self.arena.change_next(0, CONNECT_NEXT)
+        self.arena.change_active(0, bytes((SLOT_WAIT_SHARED,)))
+        for name in PERMANENT_FACTORIES:
+            self.factories.pop(name).close()
         for name in OPTIONAL_FACTORIES:
             try:
                 self.factories[name] = ServiceClient(self.mux, name, timeout=self.timeout)
             except ServiceOpenError as e:
                 log.info("optional stage not fitted: %s", e)
                 self.missing[name] = e
-        f = self.factories
-        f[WAIT_EXCLUSIVE].send(bytes((SLOT_WAIT_EXCLUSIVE,)))
-        f[WAIT_SHARED].send(bytes((SLOT_WAIT_SHARED,)))
-        f[GAIN_EXCLUSIVE].send(bytes((SLOT_GAIN_EXCLUSIVE,)))
-        f[RELEASE_EXCLUSIVE].send(bytes((SLOT_RELEASE_EXCLUSIVE,)))
-        f[DRIVE_NOWHERE].send(bytes((SLOT_STOP_A,)))
-        f[DRIVE_NOWHERE].send(bytes((SLOT_STOP_B,)))
-        f[ZERO_READINGS].send(zero_readings_stage(SLOT_ZERO, sources))
-        for slot in (SLOT_RETURN, SLOT_RETURN_RELEASE):
-            f[CROSSHEAD_POSITIONING].send(
-                motion_stage(slot, self.max_speed, self._ext_source(), 0.0))
-        self.arena.change_next(0, CONNECT_NEXT)
-        self.arena.change_active(0, bytes((SLOT_WAIT_SHARED,)))
-        for name in PERMANENT_FACTORIES:
-            f.pop(name).close()
 
     def close(self) -> None:
         for s in list(self.factories.values()):
             s.close()
         self.factories.clear()
         self.arena.close()
+        self._finish_all("closed")
+
+    def on_lost(self) -> None:
+        """The link or the machine went away: wake all waiters, end all segments."""
+        self.arena.lost()
+        self._finish_all("link lost")
+
+    def _finish_all(self, reason: str) -> None:
+        with self._lock:
+            for seg in [*self._pending, self._running]:
+                if seg is not None:
+                    seg._finish(reason)
+            self._pending.clear()
+            self._running = None
+
+    def _fail(self, what: str) -> StageError:
+        if self.arena.closed.is_set():
+            return StageError(f"{what}: connection to the machine lost")
+        return StageError(f"timed out {what} (machine in slot {self.slot})")
 
     # -- state ------------------------------------------------------------
 
@@ -446,8 +484,14 @@ class StageControl:
         the extension source's range.  Returns when the machine is ready
         (slot 7); raises :class:`StageError` if control can't be gained.
         """
-        if self.ready:
-            return
+        params = (tensile_limit, compressive_limit, stiffness, extensometer_range)
+        if self.in_control:
+            self.stop()
+            if self.ready and params == self._taken_with:
+                return
+            self.release_control()       # re-take with the new protection settings
+        self.take_attempted = True
+        self._taken_with = None
         a, f = self.arena, self.factories
         mark = a.mark()
         f[GRIP_PROTECTION].send(
@@ -472,27 +516,39 @@ class StageControl:
         a.change_active(SLOT_GAIN_EXCLUSIVE, bytes((SLOT_PARKED,)))
         t = a.wait_transition(lambda t: t.new in (SLOT_READY, SLOT_PARKED), mark, timeout)
         if t is None:
+            if a.closed.is_set():
+                raise self._fail("taking control")
             raise StageError(f"timed out taking control (machine in slot {self.slot}; "
                              "is the frame set to Remote Control?)")
         if t.new == SLOT_PARKED:
             a.change_active(SLOT_PARKED, bytes((SLOT_WAIT_SHARED,)))
             raise StageError("exclusive control could not be gained")
+        self._taken_with = params
 
     def release_control(self, timeout: float = 10.0) -> None:
         """Hand control back to the frame (0x426b20)."""
         self._cancel_holds()
         self.arena.change_active(0, RELEASE_ACTIVE)
+        self._taken_with = None
         if not self.arena.wait_slot(lambda s: s in (SLOT_WAIT_EXCLUSIVE, SLOT_WAIT_SHARED),
                                     timeout):
-            raise StageError(f"timed out releasing control (machine in slot {self.slot})")
+            raise self._fail("releasing control")
 
     def stop(self, timeout: float | None = 5.0) -> None:
         """``Console.Stop`` (0x427580): any running segment or return -> ready."""
         self._cancel_holds()
+        with self._lock:
+            pending = bool(self._pending)
+        mark = self.arena.mark()
         self.arena.change_active(0, STOP_ACTIVE)
-        if timeout is not None and self.in_control:
-            if not self.arena.wait_slot(lambda s: s == SLOT_READY, timeout):
-                raise StageError(f"timed out stopping (machine in slot {self.slot})")
+        if timeout is None:
+            return
+        if pending:
+            # a start the machine hasn't reported yet: wait for its b -> 7
+            if self.arena.wait_transition(lambda t: t.new == SLOT_READY, mark, timeout) is None:
+                raise self._fail("stopping")
+        elif self.in_control and not self.arena.wait_slot(lambda s: s == SLOT_READY, timeout):
+            raise self._fail("stopping")
 
     def zero(self, timeout: float = 10.0) -> None:
         """``Console.Zero`` (0x427570): zero all readings.  Stops a segment
@@ -501,7 +557,7 @@ class StageControl:
         mark = self.arena.mark()
         self.arena.change_active(SLOT_READY, bytes((SLOT_ZERO,)))
         if self.arena.wait_transition(lambda t: t.old == SLOT_ZERO, mark, timeout) is None:
-            raise StageError(f"timed out zeroing (machine in slot {self.slot})")
+            raise self._fail("zeroing")
 
     def return_to_zero(self, wait: bool = True, timeout: float | None = None) -> None:
         """``Console.ReturnToZero`` (0x427550): drive to 0 mm at MaxSpeed.
@@ -512,7 +568,7 @@ class StageControl:
         self.arena.change_active(SLOT_READY, bytes((SLOT_RETURN,)))
         if wait and self.arena.wait_transition(lambda t: t.old == SLOT_RETURN, mark,
                                                timeout) is None:
-            raise StageError(f"timed out returning to zero (machine in slot {self.slot})")
+            raise self._fail("returning to zero")
 
     def _require_ready(self, what: str) -> None:
         if self.slot >= BANKS[1]:
@@ -546,16 +602,22 @@ class StageControl:
             n0 = b + 1 if drive.hold > 0 else n1
             self.arena.change_next(b, bytes((n0, n1, b + 3)))
             self._bank_flag = not self._bank_flag
-            self._segments.append(seg)
+            self._pending.append(seg)
             self.arena.change_active(0, _SEGMENT_ACTIVE.replace(b"\xff", bytes((b,))))
         return seg
 
     def drive(self, drive: Drive, next_drive: Drive | None = None,
               timeout: float | None = None) -> Segment:
-        """:meth:`start` and wait for the segment to finish."""
+        """:meth:`start` and wait for the segment to finish.  On timeout the
+        machine is stopped before :class:`StageError` is raised."""
         seg = self.start(drive, next_drive)
         if not seg.wait(timeout):
-            raise StageError(f"timed out waiting for {seg}")
+            try:
+                self.stop()
+            finally:
+                raise StageError(f"timed out waiting for {seg}; stopped")
+        if seg.reason in ("link lost", "closed"):
+            raise StageError(f"{seg}: connection to the machine lost")
         return seg
 
     def _limit(self, d: Drive) -> tuple[int, float]:
@@ -588,9 +650,8 @@ class StageControl:
 
     def _cancel_holds(self) -> None:
         with self._lock:
-            for s in self._segments:
-                if s._hold_timer:
-                    s._hold_timer.cancel()
+            if self._running and self._running._hold_timer:
+                self._running._hold_timer.cancel()
 
     def _end_hold(self, seg: Segment) -> None:
         with self._lock:
@@ -602,29 +663,34 @@ class StageControl:
 
     def _on_transition(self, t: Transition) -> None:   # cf. CMachineStageWrapper_v37
         with self._lock:
-            for seg in list(self._segments):
-                if seg.finished.is_set():
-                    continue
-                if t.new == seg.base:
-                    seg.started.set()
-                elif t.new == seg.base + 1 and seg.started.is_set():
-                    seg.holding.set()
-                    seg._hold_timer = threading.Timer(seg.drive.hold, self._end_hold, (seg,))
-                    seg._hold_timer.daemon = True
-                    seg._hold_timer.start()
-                elif t.new == seg.base + 2 and seg.started.is_set():
-                    if seg._hold_timer:
-                        seg._hold_timer.cancel()
-                    seg.next_started.set()
-                elif t.new == seg.base + 3 and seg.started.is_set():
-                    seg._finish("limit reached")
-                elif seg.started.is_set() and t.old in seg.slots:
-                    seg._finish("stopped" if t.new == SLOT_READY
-                                else "superseded" if t.new >= BANKS[1]
-                                else f"left for slot {t.new}")
-                elif not seg.started.is_set() and t.new >= BANKS[1] and t.new not in seg.slots:
-                    seg._finish("superseded before starting")
+            run = self._running
+            entered = next((sg for sg in self._pending if sg.base == t.new), None)
+            if entered is not None:
+                # the machine took one of our starts; older ones were overtaken
+                while self._pending[0] is not entered:
+                    self._pending.popleft()._finish("superseded before starting")
+                self._pending.popleft()
+                if run is not None:
+                    run._finish("superseded")
+                self._running = run = entered
+                entered.started.set()
+            elif run is not None and t.new in run.slots[1:]:
+                if t.new == run.base + 1:
+                    run.holding.set()
+                    if run._hold_timer:
+                        run._hold_timer.cancel()
+                    run._hold_timer = threading.Timer(run.drive.hold, self._end_hold, (run,))
+                    run._hold_timer.daemon = True
+                    run._hold_timer.start()
+                elif t.new == run.base + 2:
+                    if run._hold_timer:
+                        run._hold_timer.cancel()
+                    run.next_started.set()
+                else:
+                    run._finish("limit reached")
+                    self._running = None
+            elif run is not None and t.old in run.slots and t.new not in run.slots:
+                run._finish("stopped" if t.new == SLOT_READY else f"left for slot {t.new}")
+                self._running = None
             if t.new == SLOT_RELEASE_EXCLUSIVE or t.new <= SLOT_GAIN_EXCLUSIVE:
-                for seg in self._segments:
-                    seg._finish("control lost")
-            self._segments = [s for s in self._segments if not s.finished.is_set()]
+                self._finish_all("control lost")

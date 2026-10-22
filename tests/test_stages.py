@@ -237,3 +237,80 @@ def test_close_releases_control():
         assert wait_until(lambda: sim.current == st.SLOT_WAIT_SHARED)
     finally:
         sim.stop()
+
+
+# -- regressions from review ---------------------------------------------------
+
+def test_back_to_back_starts_track_the_running_segment(pair):
+    m, sim = pair
+    take(m)
+    b = m.control.start(Drive.to_extension(10.0, 1.0))
+    c = m.control.start(Drive.to_extension(-0.5, 5.0, hold=0.2))
+    assert b.wait(2) and b.reason == "superseded"
+    assert c.holding.wait(3)                     # c really is tracked: hold timer runs
+    assert c.wait(3) and c.reason == "limit reached"
+    assert sim.current == 15 and sim.position == pytest.approx(-0.5)
+
+
+def test_start_while_previous_limit_report_in_flight(pair):
+    m, sim = pair
+    take(m)
+    a = m.control.start(Drive.to_extension(30.0, 1.0))
+    assert a.started.wait(2)
+    with sim._lock:                              # freeze the sim's receive handler
+        b = m.control.start(Drive.to_extension(-0.5, 5.0))
+        time.sleep(0.2)
+        sim._goto(19)                            # a reaches its limit first
+        time.sleep(0.2)
+    assert a.wait(2) and a.reason == "limit reached"
+    assert not b.finished.is_set() or b.reason == "limit reached"
+    assert b.wait(3) and b.reason == "limit reached"
+    assert sim.position == pytest.approx(-0.5)
+
+
+def test_link_loss_wakes_waiters(pair):
+    m, sim = pair
+    take(m)
+    seg = m.control.start(Drive.to_extension(30.0, 1.0))
+    assert seg.started.wait(2)
+    m._on_link_reset()
+    assert seg.wait(1) and seg.reason == "link lost"
+    with pytest.raises(StageError, match="lost"):
+        m.control.return_to_zero(timeout=None)
+
+
+def test_take_control_again_from_finished_segment(pair):
+    m, sim = pair
+    take(m)
+    m.control.drive(Drive.to_extension(1.0, 20.0), timeout=5)
+    n = len(sim.transitions)
+    take(m)                                      # same settings: just stops to ready
+    assert m.control.ready and sim.position == pytest.approx(1.0)
+    assert all(new not in (12, 16) for _, new in sim.transitions[n:])   # no re-run
+    m.control.take_control(tensile_limit=100, compressive_limit=100)    # new limits
+    assert m.control.ready and sim.grip_limits == (100.0, -100.0)
+
+
+def test_take_release_take(pair):
+    m, sim = pair
+    take(m)
+    m.control.release_control()
+    take(m)
+    time.sleep(0.2)
+    assert m.control.ready and sim.current == st.SLOT_READY
+
+
+def test_drive_timeout_stops(pair):
+    m, sim = pair
+    take(m)
+    with pytest.raises(StageError, match="stopped"):
+        m.control.drive(Drive.to_extension(30.0, 1.0), timeout=0.3)
+    assert m.control.ready
+
+
+def test_stop_right_after_start_waits_for_it(pair):
+    m, sim = pair
+    take(m)
+    seg = m.control.start(Drive.to_extension(30.0, 1.0))
+    m.control.stop()
+    assert m.control.ready and seg.wait(1) and seg.reason == "stopped"
