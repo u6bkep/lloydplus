@@ -1,17 +1,39 @@
 # Lloyd Instruments "Plus" series PC link: protocol reference
 
 This document records what is known about the RS-232 protocol between a Lloyd
-Instruments "Plus" series frame (LRX Plus, LR Plus, EZ20/EZ50, and probably the LF Plus)
-and its PC software.
+Instruments "Plus" series frame (LRX Plus, LR Plus, EZ20/EZ50 and LF Plus) and its PC
+software.
 
 ## 0. Status, scope and sources
 
 ### Status
 
-**Nothing in this document has been checked against a real machine.** It was reverse
-engineered statically from the vendor's PC software. Claims carry the address of the
-code they come from, so anyone can re-check them. Where a claim is an inference rather
-than a reading of the code, it says so.
+This document was reverse engineered statically from the vendor's PC software. Claims
+carry the address of the code they come from, so anyone can re-check them. Where a
+claim is an inference rather than a reading of the code, it says so.
+
+**Hardware observations.** `lloydplus` itself has not yet run against a machine. On
+2026-10-22 a colleague drove an LF Plus (S/N LF1154, firmware "3.0 Issue 94", 1 kN
+cell) through NEXYGEN's own console, `LrCon.exe`, via its OLE interface (GitHub issue
+#1 on this repository). Since the console is the binary analysed here, what the
+machine did in that session is evidence about this protocol:
+
+* the machine gates its transmitter on CTS (§1): silent with a 2↔3-only lead, answered
+  first time with a null modem;
+* the LF Plus is an `LrCon` machine: `Lloyd.LrLrxConsole` opened the port and never
+  connected, `Lloyd.LrConsole` connected and reported the firmware version;
+* direction comes from the limit, not from the console's tension/compression mode
+  (§11.3);
+* compression reads as negative load and decreasing extension (§10);
+* **the console's Stop did not halt a running drive** (§11.5, §11.9), while starting
+  another stage pre-empted it;
+* positioning and speed were accurate: 0.02 mm error after 42 mm of travel, 20.25 s
+  for a 20 s move at 60 mm/min;
+* the self-test menu (§1, Practical constraints) works as the service manual says,
+  with small differences.
+
+These are observations of the console's traffic, not captures of it. The wire-level
+details (§2–§9) still await a `sniff` capture.
 
 Confidence by area:
 
@@ -20,7 +42,7 @@ Confidence by area:
 | Transport (§2–§6) | High. An independent second pass compared it byte for byte with the binary, and the discrepancies found were fixed in the library. |
 | Services and readings (§7–§9) | High for byte layouts. Medium for the meaning of some fields. |
 | Units (§10) | High: N, mm, s, read from the console's unit constants. One hardware check still worthwhile. |
-| Test control / stages (§11) | High for byte layouts and the console's slot map. Medium for some stage semantics (marked "inferred"). Implemented in `lloydplus.stages`, tested only against the simulator. |
+| Test control / stages (§11) | High for byte layouts and the console's slot map. Medium for stage semantics (marked "inferred"); one of them, "a redirect into slot 7 stops a drive", was contradicted on hardware (§11.9). Implemented in `lloydplus.stages`, tested only against the simulator. |
 
 ### Source binary
 
@@ -60,8 +82,15 @@ NEXYGEN 4.1 lists the LRX Plus, EZ20 and EZ50 as the "Easy Test Series" it suppo
 manual (second-hand, see Reference documents) says the LF Plus talks to NEXYGEN and
 firmware upgrades at 57600 8N1, and sends printer/datalogger output at 9600 8N1. The
 LR/EZ manual §11.10 gives 57600 8N1 for the PC link. Both are consistent with this
-protocol. It's still possible that later
-LF Plus firmware expects the newer NEXYGENPlus console.
+protocol.
+
+Confirmed on hardware (issue #1): an LF Plus with firmware "3.0 Issue 94" connects to
+`Lloyd.LrConsole` (`LrCon.exe`) and not to `Lloyd.LrLrxConsole`. Two tells that need
+no machine: `LrLrxCon`'s port-settings dialog has a baud-rate field and `LrCon`'s
+does not (its DCB is fixed at 57600, §1), and the NEXYGEN manual's chapter split puts
+the Plus-series frames with the LRX Plus (ch. 6), not with the older LR/LRX/LF
+(ch. 5). `Lloyd.StdConsole` is an alias for whichever console registered last; don't
+rely on it.
 
 ## 1. Physical layer
 
@@ -100,8 +129,12 @@ The lead is Lloyd **09/0639**, female–female (LR/EZ manual §11.10):
 | 5 | 5 | ground |
 
 With hardware flow control enabled, a lead that crosses only 2↔3 leaves both CTS
-inputs floating. The PC console then never transmits. The machine probably doesn't
-either, if it honours CTS; that is unverified. The printer lead (09/0721) is wired
+inputs floating. The PC console then never transmits, and neither does the machine:
+it gates its transmitter on CTS. Verified on an LF Plus (issue #1): with a 2↔3-only
+lead the machine was silent at 4800–115200 baud, including to the self-test command
+below, although its TX idled at a healthy −9.2 V; with a null modem fitted the PC's
+CTS read true even with its own RTS driven low (so the machine asserts RTS), and the
+machine answered at the first attempt. The printer lead (09/0721) is wired
 differently and isn't for PC use.
 
 ### Practical constraints from the manuals
@@ -112,6 +145,16 @@ differently and isn't for PC use.
   bootloader listens for `++-` in the first ~2 s after power-on. Don't transmit in
   that window.
 * Only one program can own the COM port. Don't run NEXYGEN alongside another client.
+* **Self-test menu** (Plus service manual §11.14, confirmed on an LF Plus, issue #1).
+  `test` CR at 57600 8N1, outside a PC session, prints a plain-text menu; it is not
+  framed and has nothing to do with the link protocol. As the firmware actually
+  behaves: the heading is "System selt test:" (sic); options `r` (loopback test),
+  `v` (display voltages), `m` (menu) and an undocumented `X` (exit, silent); lines
+  end LF CR (`0a 0d`); a second `test` does not reprint the menu but toggles
+  "tracing on" / "tracing off" (unexplored). `v` lists channels 0–15: ch0 ≈ 5 V
+  supply, ch1 ≈ 4 V reference, ch5 ≈ 4 V load-cell excitation, ch6 and ch15 ≈ ±7.4 V
+  (supply ÷ 2), ch7 the load-cell amplifier output (live load plus a small offset).
+  `lloydplus diag` runs this exchange.
 
 ## 2. Layer 1: framing
 
@@ -603,8 +646,15 @@ How this was established:
 * So the `DataSet` scale string (§9.2) is N per count for load and mm per count for
   extension. The NEXYGEN automation manual agrees: `Console.Load.Name` is "in N" and
   `Console.Extension.Name` "in mm" (*Controlling NEXYGEN V4.0 using Excel* §5.2).
-* **Still worth one hardware check** (a known weight, a measured crosshead move), but
-  this is now a reading of the code, not a guess.
+* **Sign** (measured on an LF Plus through the console, issue #1): tension is
+  positive load and increasing extension; compression is negative load and decreasing
+  extension (contact at −134.6 mm / −5.49 N, compressed at −135.4 mm / −64.81 N). A
+  compressive load limit is therefore a negative number (§11.3, Direction), and
+  code that takes `max()` of loads or tests `load >= threshold` is wrong in
+  compression.
+* **Still worth one hardware check** on the wire itself (a known weight, a measured
+  crosshead move, read through `lloydplus log`), but this is now a reading of the
+  code confirmed through the console's display, not a guess.
 
 ## 11. Test control (stages)
 
@@ -640,6 +690,15 @@ than read are marked **(inferred)**.
       writes `active[3] = 0` while the machine is already in 7. If every write
       re-checked the current slot, that would bounce the machine straight back out of
       control on every test after the first.
+  * **A redirect out of a running motion stage into an empty slot does nothing**
+    **(observed, issue #1)**. The console's Stop writes `active[running] = 7`, and
+    slot 7 holds no stage. On an LF Plus that write left the crosshead driving until
+    its limit or the grip-protection latch; a redirect into a freshly created motion
+    stage (starting another segment) pre-empted it within 0.03 mm. Whether the
+    machine ignores the redirect, or follows it and keeps the motor running because
+    nothing told it otherwise, can't be told from outside; both readings give the same
+    rule for a client: to stop, redirect into a stage that stops (DriveNowhere),
+    §11.9. Whether a redirect *from* DriveNowhere into 7 works is untested.
 * **Reports.** The machine reports every slot change `(old, new)` to the PC. Nothing
   else in the stage subsystem flows machine → PC.
 * **Done on the PC, not the machine:** hold timing (§11.6), break detection (§11.7),
@@ -812,10 +871,14 @@ The connect sequence on the wire:
    release once (§11.5), to push the range setting.
 
 **What slots 1 and 2 wait for (inferred).** WaitExclusive and WaitShared hand over to
-each other through `next`. The PC breaks out with `active`. An LR/LRX Plus has to be
-put in "Remote Control" on its own keypad (A/B, or R first) before the software console
-goes active (*NEXYGEN V4.0 Training* §2). The likely reading: these stages track the
-frame's local/remote selection. The exact conditions are unverified.
+each other through `next`. The PC breaks out with `active`. The NEXYGEN training
+material (*NEXYGEN V4.0 Training* §2) says an LR/LRX must be put in "Remote Control"
+on its keypad before the console goes active, but that applies to the older
+LR/LRX/LF family (NEXYGEN manual ch. 5). Neither Plus-series manual mentions a remote
+mode; the LR/EZ manual §6.1 says connection is automatic, and on an LF Plus control
+was granted with nothing set on the frame (issue #1). So on a Plus frame these stages
+most likely wait for "no local activity" (a running keypad test, say) rather than a
+mode switch. The exact conditions are unverified.
 
 ### 11.5 Control operations
 
@@ -826,7 +889,7 @@ Notation: `A(start, [...])` = `[0x01, len, start, ...]` and `N(start, [...])` =
 |---|---|---|
 | **Take control** (`Console.Control`, start of a test) | slot 32, 0x426980 | see below |
 | **Release control** | slot 33, 0x426b20 | `A(0, [00 01 02 01 08 08 08 08 08 08 0B 0B 08×19 07])`: running slots → ReleaseExclusive (8); a return in progress (10, 11) → 11; GainExclusive → back to 1. Slot 31 → 7 is as found in the code |
-| **Stop** (`Console.Stop`) | slot 53, 0x427580 | cancel the hold timer; `A(0, [00 01 02 03 04 05 06 07 08 09 07 08, 07×20])`: segment slots and slot 10 → 7 (ready); slot 11 → 8 |
+| **Stop** (`Console.Stop`) | slot 53, 0x427580 | cancel the hold timer; `A(0, [00 01 02 03 04 05 06 07 08 09 07 08, 07×20])`: segment slots and slot 10 → 7 (ready); slot 11 → 8. **On hardware this did not halt a running drive** (§11.1, §11.9). The OLE `Stop` (dispatch thunk 0x42cee0) and the GUI (`CLrMachine_v53`) both reach this same routine |
 | **Zero** (`Console.Zero`) | slot 51, 0x427570 | `A(7, [09])`. Only acts while in slot 7, which is why the manual says Stop first |
 | **ReturnToZero** | slot 50, 0x427550 | cancel the hold timer; `A(7, [0A])`. Only from slot 7, matching the manual's "only if the machine has been stopped" |
 | cancel the return dialog | 0x4289a0 | `A(11, [08])` |
@@ -965,6 +1028,18 @@ Independently, leaving slot 11 (`old == 11`) hides the cancel-return dialog.
   run.
 * **Failed take-control.** After GainExclusive fails (slot 0), it re-writes
   `active[0] = 2` so the machine goes back to the wait loop and a retry can work.
+* **Stop.** `stop()` sends two writes: first `HALT_ACTIVE`,
+  `A(0, [00..09, 0F×6 (slots 10–15), 13×4 (slots 16–19), 07×12])`, which redirects a
+  running drive, hold, next drive or return into its bank's DriveNowhere stage (15 or
+  19), then the console's `STOP_ACTIVE` to go from there to 7. The console sends only
+  the second; on an LF Plus that alone left the crosshead running (§11.1). The
+  colleague's working stop on the OLE route was equivalent: start a new stage whose
+  limit is the present position. A segment ended by `stop()` finishes with reason
+  `"stopped"` even if it entered `b+3` by reaching its limit in the same instant.
+  **Untested on hardware**, like everything else here; it is the first thing to try.
+  If the second write turns out not to move the machine from DriveNowhere to 7
+  either, the fallback is a redirect into a stage whose `next` chain ends in 7, such
+  as `N(4, [07])` then `A(b+3, [04])` (re-arm grip protection, then ready).
 * **Stop before Zero/ReturnToZero.** If a segment is running or finished in a bank,
   Zero and ReturnToZero issue Stop first. The console requires the script to do it.
 * **Release on close.** `LloydPlus.close()` stops and releases control if the PC holds
@@ -1026,15 +1101,17 @@ Stage subsystem (§11):
 
 | question | how to settle |
 |---|---|
-| Does the LF Plus speak this protocol? | `lloydplus sniff`: look for `BOOT state=0` frames. If silent, `lloydplus info` (it transmits handshake and queries only). |
-| Does the machine gate its TX on CTS? | Compare `sniff` with and without pins 7/8 crossed. |
-| Units: confirm N and mm (§10) | Known weight on the load cell; measured crosshead travel. |
+| Does the LF Plus speak this protocol? | **Answered** (issue #1): it connects to `LrCon.exe`. Still wanted: a `lloydplus sniff` / `info` run to see the wire. |
+| Does the machine gate its TX on CTS? | **Answered** (issue #1): yes. |
+| Does `stop()` halt a drive? (§11.9) | Free air, 30 mm move at 10 mm/min, `stop()` half way; the head should halt within a fraction of a mm and the machine report `b → b+3 → 7`. Then the same during a hold and during ReturnToZero. If it stops in `b+3` and never reaches 7, try the fallback in §11.9. |
+| Does a redirect into slot 7 ever stop motion? | Send `STOP_ACTIVE` alone during a drive and watch for a `b → 7` report. Tells apart "redirect ignored" from "followed but motor left running" (§11.1). |
+| Units: confirm N and mm on the wire (§10) | Known weight on the load cell; measured crosshead travel, read through `lloydplus log`. The console's display already agrees (issue #1). |
 | Machine-side boot behaviour | First seconds of a capture. |
 | `DataInformation` `extra` and the a/b fields | Read real records with `lloydplus -v info`. |
 | `KeypadEZ` codes | Unknown; not needed. |
 | Exact machine-side timing | A capture of a real NEXYGEN session through a passive RS-232 tap, decoded with `lloydplus sniff --file`, would confirm the whole of §2–§11 at once. |
 | `active` table semantics, and the take-control race (§11.5 step 5) | Capture a take-control. Check that `01 01 03 00` arrives after the machine has already left slot 3. |
-| What WaitExclusive / WaitShared wait for (§11.4) | Watch transition reports while toggling Local/Remote on the frame's keypad. |
+| What WaitExclusive / WaitShared wait for (§11.4) | Watch transition reports while using the frame's own keypad (start a local test, open a menu); Plus frames have no Local/Remote switch. |
 | What an empty slot (0, 7) does | Transition reports after connect: the machine should sit in 7 once control is taken. |
 | Does a rate-0 hold ever complete by itself? (§11.7) | Run a stage with HoldTime and watch for a `b+1 →` report. |
 | Does the machine accept two-digit exponents? | Send `5.0e+01` instead of `5.000000e+001` and compare. Until then, emit MSVC's form. |

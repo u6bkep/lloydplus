@@ -1,4 +1,4 @@
-"""Command line: ``lloydplus {sniff,info,log,move,zero,home}``."""
+"""Command line: ``lloydplus {sniff,diag,info,log,move,zero,home}``."""
 
 from __future__ import annotations
 
@@ -68,6 +68,61 @@ def cmd_sniff(args) -> int:
     return 0
 
 
+def _raw_port(port: str, baud: int):
+    import serial
+    s = serial.Serial(port, baud, rtscts=False, timeout=0.2)
+    s.rts = True
+    s.dtr = False
+    return s
+
+
+def cmd_diag(args) -> int:
+    """The firmware's plain-text self-test menu (Plus service manual §11.14).
+
+    No link protocol involved: ``test\r`` at 57600 8N1 prints a menu, ``v``
+    dumps the analogue channels, ``X`` leaves.  Quirks seen on an LF Plus
+    (issue #1): lines end LF CR; a second ``test`` toggles "tracing on" /
+    "tracing off" instead of reprinting the menu, so this command sends it
+    once and undoes an accidental toggle.
+    """
+    s = _raw_port(args.port, args.baud)
+
+    def ask(cmd: bytes, quiet: float = 0.4) -> str:
+        s.write(cmd)
+        buf = b""
+        t_end = time.monotonic() + args.wait
+        while time.monotonic() < t_end:
+            chunk = s.read(256)
+            if chunk:
+                buf += chunk
+                t_end = time.monotonic() + quiet
+        return buf.decode("ascii", "replace").replace("\n\r", "\n").replace("\r\n", "\n")
+
+    try:
+        menu = ask(b"test\r")
+        if "tracing on" in menu:
+            print("# firmware was already in its menu: 'test' switched tracing on; "
+                  "switching it off", file=sys.stderr)
+            print(ask(b"test\r"), end="")
+            menu = ask(b"m")
+        print(menu, end="")
+        if not menu.strip():
+            print("# no answer: check the lead (pins 7-8 crossed), the port and the baud "
+                  "rate; the frame must be idle, not in a PC session", file=sys.stderr)
+            return 1
+        if args.voltages:
+            v = ask(b"v")
+            if not v.strip():
+                v = ask(b"v\r")
+            print(v, end="")
+    finally:
+        try:
+            s.write(b"X")
+        finally:
+            s.close()
+    return 0
+
+
 def _connect(args, control: bool = True):
     """``control=False`` keeps to link handshake and queries (no stage setup)."""
     from .machine import LloydPlus
@@ -119,10 +174,15 @@ def cmd_log(args) -> int:
 def _take_control(args, m) -> None:
     if m.control is None:
         raise SystemExit("this machine did not offer the stage services; no test control")
-    rated = m.parameters.load_range
-    m.control.take_control(
-        tensile_limit=args.tensile_limit if args.tensile_limit is not None else rated,
-        compressive_limit=args.compressive_limit if args.compressive_limit is not None else rated)
+    # Default grip protection: 10 % of the frame's load range, which is what the
+    # console's factory defaults (100 N / 100 N) come to on a 1 kN frame.  On
+    # hardware this latch is what ended two runaway moves (issue #1).
+    default = m.parameters.load_range / 10
+    tensile = args.tensile_limit if args.tensile_limit is not None else default
+    compressive = args.compressive_limit if args.compressive_limit is not None else default
+    print(f"grip protection: +{tensile:g} N tension / -{compressive:g} N compression",
+          file=sys.stderr)
+    m.control.take_control(tensile_limit=tensile, compressive_limit=compressive)
 
 
 def _readings(m) -> str:
@@ -149,6 +209,7 @@ def cmd_move(args) -> int:
         except KeyboardInterrupt:
             print("stopping", file=sys.stderr)
             m.control.stop()
+            seg.wait(1.0)
         print(f"done ({seg.reason}): {_readings(m)}")
     finally:
         m.close()           # stops and releases control
@@ -197,6 +258,15 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--raw", help="append raw received bytes to this file")
     sp.set_defaults(func=cmd_sniff)
 
+    dp = sub.add_parser("diag", help="firmware self-test menu and voltages (plain text, "
+                                     "no link protocol)")
+    dp.add_argument("--port", required=True)
+    dp.add_argument("--baud", type=int, default=57600)
+    dp.add_argument("--wait", type=float, default=2.0, help="seconds to wait for an answer")
+    dp.add_argument("--no-voltages", dest="voltages", action="store_false",
+                    help="only print the menu")
+    dp.set_defaults(func=cmd_diag)
+
     for name, func, hlp in (("info", cmd_info, "connect and print machine information"),
                             ("log", cmd_log, "stream readings to CSV"),
                             ("move", cmd_move, "drive the crosshead to an extension or load"),
@@ -212,12 +282,16 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--seconds", type=float)
         if name in ("move", "zero", "home"):
             p.add_argument("--tensile-limit", type=float, metavar="N",
-                           help="grip protection, tension (default: frame load range)")
+                           help="grip protection, tension, positive N "
+                                "(default: 10%% of the frame's load range)")
             p.add_argument("--compressive-limit", type=float, metavar="N",
-                           help="grip protection, compression (default: frame load range)")
+                           help="grip protection, compression, positive N "
+                                "(default: 10%% of the frame's load range)")
         if name == "move":
-            p.add_argument("--to", type=float, metavar="MM", help="extension limit, mm")
-            p.add_argument("--load", type=float, metavar="N", help="load limit, N")
+            p.add_argument("--to", type=float, metavar="MM",
+                           help="extension limit, mm from the last zero (down is negative)")
+            p.add_argument("--load", type=float, metavar="N",
+                           help="load limit, N (tension positive, compression negative)")
             p.add_argument("--speed", type=float, required=True, metavar="MM_PER_MIN")
             p.add_argument("--hold", type=float, default=0.0, metavar="S",
                            help="hold at the limit for S seconds")

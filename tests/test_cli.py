@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from lloydplus import LloydPlus, cli
@@ -35,3 +37,34 @@ def test_move_zero_home(sim_cli, capsys):
 def test_info_does_not_set_up_stages(sim_cli, capsys):
     assert cli.main(["info", "--port", "x"]) == 0
     assert sim_cli[-1].arena_packets == [] and sim_cli[-1].factory_packets == []
+
+
+def test_diag(monkeypatch, capsys):
+    pc, fw = port_pair()
+    menu = b"System selt test:\n\roptions:\n\rr - run loopback test\n\rv - display voltages\n\rm - menu\n\rX - exit\n\r"
+    log = []
+
+    def firmware():
+        tests = 0
+        while True:
+            c = fw.read(64)
+            if not c:
+                continue
+            log.append(c)
+            if c == b"test\r":
+                tests += 1
+                fw.write(menu if tests == 1 else b"tracing on\n\r")
+            elif c == b"v":
+                fw.write(b"ch[0] = 4.9652\n\rch[1] = 3.9975\n\r")
+            elif c == b"X":
+                return
+
+    t = threading.Thread(target=firmware, daemon=True)
+    t.start()
+    monkeypatch.setattr(cli, "_raw_port", lambda port, baud: pc)
+    assert cli.main(["diag", "--port", "x", "--wait", "0.5"]) == 0
+    out = capsys.readouterr().out
+    assert "System selt test:" in out and "ch[1] = 3.9975" in out
+    assert "\n\r" not in out
+    t.join(2)
+    assert log == [b"test\r", b"v", b"X"]

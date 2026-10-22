@@ -5,8 +5,13 @@ Python driver for the RS-232 PC link of Lloyd Instruments "Plus" series test fra
 (`LrCon.exe`). The protocol was reverse engineered from NEXYGEN 4.1; see
 [PROTOCOL.md](PROTOCOL.md) for the wire format, with binary addresses as evidence.
 
-Status: built from static analysis and tested only against the bundled protocol
-simulator. **It has not yet talked to a real machine.**
+Status: built from static analysis and tested against the bundled protocol
+simulator. **This library has not yet talked to a real machine.** Parts of the
+analysis have, though: on 2026-10-22 a colleague drove an LF Plus through NEXYGEN's
+own console (`LrCon.exe`, via OLE) and confirmed the lead and CTS behaviour, that the
+LF Plus is an `LrCon` machine, and that direction comes from the limit. The same
+session showed that the console's own Stop does **not** halt a running drive; see
+"Test control" below and PROTOCOL.md §11.9 for what this library does instead.
 
 ## Wiring
 
@@ -22,8 +27,26 @@ equivalent of the Lloyd 09/0639 lead:
 | 5 | 5 | ground |
 
 A lead that crosses only 2↔3 leaves both CTS inputs floating. The original console
-runs with hardware flow control, so neither side may ever transmit. If you can't
-rewire, jumper 7–8 on the machine-facing connector and run with `--no-rtscts`.
+runs with hardware flow control, and the machine gates its own transmitter on CTS
+(verified on an LF Plus: with a 2↔3-only lead it was silent at every baud rate, with
+a null modem it answered first time). If you can't rewire, jumper 7–8 on the
+machine-facing connector and run with `--no-rtscts`.
+
+## Zero-protocol check: the firmware's self-test menu
+
+```
+uv run lloydplus diag --port /dev/ttyUSB0
+```
+
+The firmware answers `test` + CR at 57600 8N1 with a plain-text menu (Plus Series
+Service Manual §11.14) and `v` with its analogue channels: 5 V and 4 V rails,
+load-cell excitation, ±supply/2 and the live load-cell amplifier output. Five bytes
+tell you the port, the lead and the analogue front end are alive, with no driver in
+the loop. Quirks seen on an LF Plus: the menu is headed "System selt test" (sic),
+lines end LF CR, there is an undocumented `X` to exit, and a second `test` toggles
+"tracing on/off" instead of reprinting the menu. `diag` sends `test` once, undoes an
+accidental toggle, and exits with `X`. Run it with the frame idle, not during a PC
+session.
 
 ## First test: listen only
 
@@ -66,19 +89,35 @@ handshake and query traffic.
 ## Test control
 
 **This moves the crosshead.** It has only run against the simulator, so keep a hand on
-the emergency stop the first time. An LR/LRX Plus with a keypad must be set to
-Remote Control first.
+the emergency stop the first time, and run the first moves in free air.
+
+Two things learned on hardware shape this section. First, the console's own Stop
+command (the same arena write the manual's `Console.Stop` sends) **did not halt a
+running drive** on an LF Plus; the crosshead ran on until the grip-protection load
+limit latched. Starting another stage did pre-empt it. So `stop()` here first
+redirects the running drive into the bank's DriveNowhere stage, then sends the
+console's Stop. That ordering is untested on hardware; until it is, treat Ctrl+C and
+`stop()` as unproven and keep the e-stop in reach. Second, grip protection is what
+actually ended those runaway moves, so the CLI defaults it to 10 % of the frame's load
+range (the console's factory default is 100 N either way).
+
+A Plus-series frame connects automatically; there is no Remote Control setting to
+make (that step belongs to the older LR/LRX/LF keypads, NEXYGEN manual ch. 5).
 
 ```
 uv run lloydplus move --port /dev/ttyUSB0 --to 10 --speed 50          # to 10 mm at 50 mm/min
-uv run lloydplus move --port /dev/ttyUSB0 --load 200 --speed 20 --hold 30
+uv run lloydplus move --port /dev/ttyUSB0 --load -50 --speed 10        # compress to 50 N
+uv run lloydplus move --port /dev/ttyUSB0 --load 200 --speed 20 --hold 30   # pull to 200 N, hold
 uv run lloydplus zero --port /dev/ttyUSB0                             # zero load and extension
 uv run lloydplus home --port /dev/ttyUSB0                             # back to 0 mm, max speed
 ```
 
 Each command takes control, does its job, then stops and hands control back. Ctrl+C
-during a move stops the crosshead. Grip protection defaults to the frame's load range;
-set it with `--tensile-limit` / `--compressive-limit` (N).
+during a move sends the stop sequence described above. Grip protection defaults to
+10 % of the frame's load range; set it with `--tensile-limit` / `--compressive-limit`
+(both positive, N). On a thin or stiff specimen the approach speed, not the load
+limit, is what protects it: at 10 mm/min a 2 N touch-off was detected at 2.2 N, at
+60 mm/min the same threshold overshot to 104 N.
 
 From Python (units: mm, N, mm/s, N/s, s):
 
@@ -101,6 +140,10 @@ with LloydPlus("/dev/ttyUSB0") as m:
 * **Limits** are absolute (from the last zero). `Drive.to_load` uses a load limit;
   `Drive.at_load_rate` drives at N/s and needs the machine's LoadRate option.
 * **Direction** comes from the limit; speeds are always positive.
+* **Sign convention** (measured on an LF Plus): tension is positive load and
+  increasing extension; **compression is negative load and decreasing extension**.
+  A compressive load limit is a negative number, and a "load above threshold" test
+  written for tension can never fire in compression.
 * **Pre-empting:** starting a new segment pre-empts the running one, as in NEXYGEN.
 * **Break detection** is a PC-side job in NEXYGEN as well: watch the readings and call
   `c.stop()`.
@@ -119,7 +162,7 @@ PROTOCOL.md §11.
 | `machine.py` | `LloydPlus`: connect sequence and the high-level API |
 | `stages.py` | test control: stage arena, stage-factory encoders, `StageControl`, `Drive` |
 | `sim.py` | machine-side simulator used by the tests (including a stage engine and a crosshead/sample model) |
-| `cli.py` | `sniff`, `info`, `log`, `move`, `zero`, `home` |
+| `cli.py` | `sniff`, `diag`, `info`, `log`, `move`, `zero`, `home` |
 | `re/` | the reverse-engineering scripts (RTTI vtable recovery, Ghidra decompile and naming, string-table dump); see PROTOCOL.md §14 |
 
 ## Tests

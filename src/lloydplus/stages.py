@@ -4,7 +4,11 @@ The machine runs "stages" out of a 32-slot arena.  Each stage kind has its own
 factory service; the PC creates a stage by sending ``[slot, params...]`` to it.
 ``StageArenaReference5`` holds two tables: ``next[i]`` (where to go when the
 stage in slot i completes) and ``active[i]`` (a redirect out of slot i,
-applied when written).  The machine reports every slot change.
+applied when written).  The machine reports every slot change.  On hardware,
+a redirect out of a running drive into the empty slot 7 (the console's Stop)
+did not halt the crosshead, while a redirect into another motion stage did
+(PROTOCOL.md §11.1); :meth:`StageControl.stop` therefore redirects into the
+bank's DriveNowhere stage first.
 
 :class:`StageControl` reproduces the slot layout and command sequences of the
 NEXYGEN 4.1 console (``CMachineStageWrapper``, 0x4256f0..0x4289d0).
@@ -83,6 +87,12 @@ PERMANENT_FACTORIES = (
 CONNECT_NEXT = bytes((0, 2, 1, 4, 5, 6, 7, 7, 1, 7, 7, 8))           # 0x426573
 RELEASE_ACTIVE = bytes((0, 1, 2, 1) + (8,) * 6 + (11, 11) + (8,) * 19 + (7,))  # 0x426b20
 STOP_ACTIVE = bytes(range(10)) + bytes((7, 8)) + bytes((7,)) * 20    # 0x427580
+# lloydplus addition (PROTOCOL.md §11.9): every motion slot -> its bank's
+# DriveNowhere stage (15 or 19), which stops the crosshead where it is.  Sent
+# before STOP_ACTIVE, whose redirect into the empty slot 7 did not halt a
+# running drive on hardware.
+HALT_ACTIVE = (bytes(range(10)) + bytes((SLOT_STOP_A,)) * 6
+               + bytes((SLOT_STOP_B,)) * 4 + bytes((7,)) * 12)
 _SEGMENT_ACTIVE = (bytes(range(7)) + b"\xff\x08\x09\xff\xff" + b"\xff" * 8
                    + bytes((7,)) * 12)                                # 0x4280e0
 
@@ -272,6 +282,11 @@ class Drive:
     ``speed`` is mm/s, or N/s for a load-rate stage (needs the LoadRate
     option).  ``hold`` is seconds; during it the machine holds the limit
     (load, if the limit is a load; position otherwise).
+
+    Direction comes from the limit, so the sign matters.  Measured on an LF
+    Plus: tension is positive load and increasing extension; **compression
+    is negative load and decreasing extension**.  ``Drive.to_load(-50, ...)``
+    compresses to 50 N; ``Drive.to_load(50, ...)`` pulls.
     """
     limit: float
     speed: float
@@ -356,7 +371,10 @@ class StageControl:
       slot to the next drive or the stop slot (the console sends nothing and
       leaves the machine holding);
     * if GainExclusive fails (slot 0), :meth:`take_control` re-arms
-      ``active[0] = 2`` so the machine returns to the wait loop.
+      ``active[0] = 2`` so the machine returns to the wait loop;
+    * :meth:`stop` first redirects any running drive into the bank's
+      DriveNowhere stage (``HALT_ACTIVE``), then sends the console's own Stop
+      write.  The console's write alone did not stop a drive on hardware.
     * TrueStrainRate stages are not offered: the rate's unit is unresolved.
 
     See PROTOCOL.md §11.9 for the full list.
@@ -376,6 +394,7 @@ class StageControl:
         self._bank_flag = False            # wrapper+0x1b0: False -> 16, True -> 12
         self._pending: deque[Segment] = deque()   # started, not yet entered (cf. +0x1a4)
         self._running: Segment | None = None
+        self._halting = False              # a stop() is in flight: b+3 means "stopped"
         self.take_attempted = False
         self._taken_with: tuple | None = None
         self.arena = StageArena(mux, timeout)
@@ -535,11 +554,23 @@ class StageControl:
             raise self._fail("releasing control")
 
     def stop(self, timeout: float | None = 5.0) -> None:
-        """``Console.Stop`` (0x427580): any running segment or return -> ready."""
+        """Halt the crosshead and go to ready (slot 7).
+
+        Two arena writes.  ``HALT_ACTIVE`` redirects a running drive, hold,
+        next drive or return into its bank's DriveNowhere stage (``b+3``),
+        which stops the crosshead where it is.  Then the console's own Stop
+        (0x427580, ``STOP_ACTIVE``) takes the machine from there to ready.
+        The console sends only the second write; on hardware that alone did
+        not halt a running drive (PROTOCOL.md §11.9).
+
+        A segment ended this way finishes with reason ``"stopped"``.
+        """
         self._cancel_holds()
         with self._lock:
             pending = bool(self._pending)
+            self._halting = pending or self._running is not None
         mark = self.arena.mark()
+        self.arena.change_active(0, HALT_ACTIVE)
         self.arena.change_active(0, STOP_ACTIVE)
         if timeout is None:
             return
@@ -602,6 +633,7 @@ class StageControl:
             n0 = b + 1 if drive.hold > 0 else n1
             self.arena.change_next(b, bytes((n0, n1, b + 3)))
             self._bank_flag = not self._bank_flag
+            self._halting = False
             self._pending.append(seg)
             self.arena.change_active(0, _SEGMENT_ACTIVE.replace(b"\xff", bytes((b,))))
         return seg
@@ -686,11 +718,13 @@ class StageControl:
                     if run._hold_timer:
                         run._hold_timer.cancel()
                     run.next_started.set()
-                else:
-                    run._finish("limit reached")
+                else:                              # b+3, DriveNowhere
+                    run._finish("stopped" if self._halting else "limit reached")
                     self._running = None
             elif run is not None and t.old in run.slots and t.new not in run.slots:
                 run._finish("stopped" if t.new == SLOT_READY else f"left for slot {t.new}")
                 self._running = None
+            if t.new == SLOT_READY:
+                self._halting = False
             if t.new == SLOT_RELEASE_EXCLUSIVE or t.new <= SLOT_GAIN_EXCLUSIVE:
                 self._finish_all("control lost")

@@ -55,6 +55,10 @@ def test_table_constants():
     assert st.RELEASE_ACTIVE[:12] == bytes.fromhex("00 01 02 01 08 08 08 08 08 08 0b 0b")
     assert st.RELEASE_ACTIVE[31] == 7
     assert st.STOP_ACTIVE[:12] == bytes.fromhex("00 01 02 03 04 05 06 07 08 09 07 08")
+    assert len(st.HALT_ACTIVE) == 32 and st.HALT_ACTIVE[:10] == bytes(range(10))
+    assert st.HALT_ACTIVE[10:16] == bytes((15,) * 6)       # returns and bank A -> DriveNowhere 15
+    assert st.HALT_ACTIVE[16:20] == bytes((19,) * 4)       # bank B -> DriveNowhere 19
+    assert st.HALT_ACTIVE[20:] == bytes((7,) * 12)
 
 
 # -- against the simulator ----------------------------------------------------
@@ -314,3 +318,55 @@ def test_stop_right_after_start_waits_for_it(pair):
     seg = m.control.start(Drive.to_extension(30.0, 1.0))
     m.control.stop()
     assert m.control.ready and seg.wait(1) and seg.reason == "stopped"
+
+
+# -- stop: what the hardware taught us (issue #1) ---------------------------
+
+def test_console_stop_write_alone_does_not_halt(pair):
+    """The simulator encodes the observation: the console's Stop (a redirect
+    from a running drive into the empty slot 7) leaves the crosshead moving."""
+    m, sim = pair
+    take(m)
+    seg = m.control.start(Drive.to_extension(30.0, 20.0))
+    assert seg.started.wait(2)
+    m.control.arena.change_active(0, st.STOP_ACTIVE)
+    assert wait_until(lambda: sim.position > 5.0)
+    assert sim.current == seg.base                      # still driving
+    assert seg.wait(5) and seg.reason == "limit reached" and sim.position == pytest.approx(30.0)
+
+
+def test_stop_halts_running_drive(pair):
+    m, sim = pair
+    take(m)
+    seg = m.control.start(Drive.to_extension(30.0, 2.0))
+    assert seg.started.wait(2)
+    assert wait_until(lambda: sim.position > 0.2)
+    m.control.stop()
+    where = sim.position
+    assert seg.wait(1) and seg.reason == "stopped"
+    assert m.control.ready and where < 1.0
+    assert sim.arena_packets[-2:] == [b"\x01\x20\x00" + st.HALT_ACTIVE,
+                                      b"\x01\x20\x00" + st.STOP_ACTIVE]
+    assert (seg.base, seg.base + 3) in sim.transitions and (seg.base + 3, 7) in sim.transitions
+    time.sleep(0.1)
+    assert sim.position == where                        # and it stays put
+
+
+def test_stop_during_hold(pair):
+    m, sim = pair
+    take(m)
+    seg = m.control.start(Drive.to_extension(1.0, 20.0, hold=30.0))
+    assert seg.holding.wait(3)
+    m.control.stop()
+    assert seg.wait(1) and seg.reason == "stopped" and m.control.ready
+    assert sim.position == pytest.approx(1.0)
+
+
+def test_stop_during_return(pair):
+    m, sim = pair
+    take(m)
+    m.control.drive(Drive.to_extension(20.0, 20.0), timeout=5)
+    m.control.return_to_zero(wait=False)
+    assert wait_until(lambda: sim.current == st.SLOT_RETURN and sim.position < 19.0)
+    m.control.stop()
+    assert m.control.ready and 0.0 < sim.position < 19.0
