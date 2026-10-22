@@ -101,17 +101,23 @@ Vendor documents cited here (not included in this repository):
 | short name | document |
 |---|---|
 | LR/EZ manual | *LR_Plus Series and EZ Series Universal Test Machine User Manual*, Lloyd Instruments, Part No. 01/3461, May 2014 (`dual_column_test_stands_lr_and_ez_manual_english.pdf`) |
-| Plus service manual | *Lloyd Instruments Plus Series Service Manual*, issue 10 (`service-manuals-plus-series-issue-10.pdf`), covering the LF Plus. Claims attributed to it here come from an earlier summary of it and have not been re-checked against the document. |
+| Plus service manual | *Lloyd Instruments Plus Series Service Manual*, issue 10 (`service-manuals-plus-series-issue-10.pdf`), covering the LF Plus, LR Plus, LRX Plus and EZ. §2 microprocessor circuits and RS232, §3.2 upgrading the program, §11.14 PC diagnostic mode, §11.15 load-cell data points. |
 | Automation manual | *Controlling NEXYGEN V4.0 using Excel*, part 01/2987 (on the NEXYGEN 4.1 CD) |
 
 ### Machine compatibility
 
 NEXYGEN 4.1 lists the LRX Plus, EZ20 and EZ50 as the "Easy Test Series" it supports
 ("NEXYGEN V4.1 and Ondio V4.1" manual §1.2). The LF Plus isn't named. The Plus service
-manual (second-hand, see Reference documents) says the LF Plus talks to NEXYGEN and
-firmware upgrades at 57600 8N1, and sends printer/datalogger output at 9600 8N1. The
-LR/EZ manual §11.10 gives 57600 8N1 for the PC link. Both are consistent with this
-protocol.
+manual §2.2 says the machine is "operated by a computer using the Lloyd Instruments
+NEXYGEN software which automatically uses a Baud rate of 57,600", that the flash program
+is upgraded at 57600 8N1, and that printer/datalogger/HyperTerminal output is 9600 8N1;
+its lead table is the same 09/0639 pinout as §1. The LR/EZ manual §11.10 gives 57600 8N1
+for the PC link. Both are consistent with this protocol.
+
+The hardware behind the protocol (service manual §2.1): a Motorola 68332 at about
+21 MHz on the "MT Control PCB", program in a 1 MB flash (IC4), parameters in two 128 KB
+SRAMs, test set-ups and data in a 32 KB battery-backed RAM, with a reset switch S1 on
+the board.
 
 Confirmed on hardware (issue #1): an LF Plus with firmware "3.0 Issue 94" connects to
 `Lloyd.LrConsole` (`LrCon.exe`) and not to `Lloyd.LrLrxConsole`. Two tells that need
@@ -170,8 +176,12 @@ differently and isn't for PC use.
 
 * After a PC session, the frame's own "Print" is refused until power-cycle ("Print
   unavailable. Power down and retry", LR/EZ manual §9).
-* According to the Plus service manual (second-hand, see Reference documents), the
-  bootloader listens for `++-` in the first ~2 s after power-on. Don't transmit in
+* **Bootloader** (Plus service manual §3.2). Typing `++-` within 2 s of power-on, at
+  57600 8N1 with hardware flow control, answers "Bootloader V1.1 ready for flash
+  upgrade". Its only documented function is to receive a new program as a text file
+  (HyperTerminal "Send Text File"; progress as "assembly id accepted" messages and
+  dots, "flash upgrade OK" at the end, `*` to restart). An upgrade erases all user test
+  set-ups and stored test data. No read-back command is documented. Don't transmit in
   that window.
 * Only one program can own the COM port. Don't run NEXYGEN alongside another client.
 * **Self-test menu** (Plus service manual §11.14, confirmed on an LF Plus, issue #1).
