@@ -68,10 +68,10 @@ def cmd_sniff(args) -> int:
     return 0
 
 
-def _raw_port(port: str, baud: int):
+def _raw_port(port: str, baud: int, rts: bool = True):
     import serial
     s = serial.Serial(port, baud, rtscts=False, timeout=0.2)
-    s.rts = True
+    s.rts = rts          # the machine only transmits while its CTS is asserted
     s.dtr = False
     return s
 
@@ -83,20 +83,26 @@ def cmd_diag(args) -> int:
     dumps the analogue channels, ``X`` leaves.  Quirks seen on an LF Plus
     (issue #1): lines end LF CR; a second ``test`` toggles "tracing on" /
     "tracing off" instead of reprinting the menu, so this command sends it
-    once and undoes an accidental toggle.
+    once and undoes an accidental toggle.  The frame must be idle: for ~4 s
+    after a PC session it still streams readings, and when idle it floods
+    ``BOOT`` frames, which this strips from the output.
     """
-    s = _raw_port(args.port, args.baud)
+    s = _raw_port(args.port, args.baud, rts=args.rts)
 
     def ask(cmd: bytes, quiet: float = 0.4) -> str:
         s.write(cmd)
         buf = b""
-        t_end = time.monotonic() + args.wait
-        while time.monotonic() < t_end:
+        t0 = time.monotonic()
+        t_end = t0 + args.wait
+        while time.monotonic() < min(t_end, t0 + 2 * args.wait):   # bounded even if it streams
             chunk = s.read(256)
             if chunk:
                 buf += chunk
                 t_end = time.monotonic() + quiet
-        return buf.decode("ascii", "replace").replace("\n\r", "\n").replace("\r\n", "\n")
+        # An idle machine floods the line with 6-byte BOOT frames; keep only text.
+        import re
+        text = b"".join(m + b"\n" for m in re.findall(rb"[\x20-\x7e]{4,}", buf))
+        return text.decode("ascii")
 
     try:
         menu = ask(b"test\r")
@@ -265,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     dp.add_argument("--wait", type=float, default=2.0, help="seconds to wait for an answer")
     dp.add_argument("--no-voltages", dest="voltages", action="store_false",
                     help="only print the menu")
+    dp.add_argument("--no-rts", dest="rts", action="store_false",
+                    help="leave RTS low (the machine then keeps its BOOT flood to itself)")
     dp.set_defaults(func=cmd_diag)
 
     for name, func, hlp in (("info", cmd_info, "connect and print machine information"),

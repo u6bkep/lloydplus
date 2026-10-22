@@ -84,6 +84,7 @@ class Link:
         self.retransmit_timeout = retransmit_timeout
         self.max_in_flight = max_in_flight
         self.name = name
+        self.last_trace: str | None = None
 
         self._lock = threading.RLock()
         self._wlock = threading.Lock()
@@ -230,7 +231,20 @@ class Link:
             # which is discarded on receipt, so echoes never ping-pong
             self._write_frame(bytes((PROTO_RAW,)) + payload)
         else:
-            log.debug("%s: discarding proto %#x", self.name, proto)
+            self._on_raw(proto, payload)
+
+    def _on_raw(self, proto: int, payload: bytes) -> None:
+        # The firmware uses RAW (0x04) frames for trace text: "Growing",
+        # "Maturing" (link coming up), "Now idle" every ~250 ms, "comm1 reset"
+        # (watchdog expired).  Log a change of text at INFO, repeats at DEBUG.
+        if proto == PROTO_RAW and payload and all(32 <= b < 127 for b in payload):
+            text = payload.decode("ascii")
+            level = logging.DEBUG if text == self.last_trace else logging.INFO
+            self.last_trace = text
+            log.log(level, "%s: machine trace %r", self.name, text)
+        else:
+            log.debug("%s: discarding proto %#x [%d] %s", self.name, proto, len(payload),
+                      payload[:64].hex(" "))
 
     def _on_boot(self, rx: int) -> None:
         reply = None

@@ -61,7 +61,7 @@ def test_diag(monkeypatch, capsys):
 
     t = threading.Thread(target=firmware, daemon=True)
     t.start()
-    monkeypatch.setattr(cli, "_raw_port", lambda port, baud: pc)
+    monkeypatch.setattr(cli, "_raw_port", lambda port, baud, rts=True: pc)
     assert cli.main(["diag", "--port", "x", "--wait", "0.5"]) == 0
     out = capsys.readouterr().out
     assert "System selt test:" in out and "ch[1] = 3.9975" in out
