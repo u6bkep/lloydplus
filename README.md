@@ -55,9 +55,57 @@ from lloydplus import LloydPlus
 
 with LloydPlus("/dev/ttyUSB0") as m:
     print(m.version, m.description, m.parameters, m.sources)
-    for s in m.samples(timeout=5):          # s.source: 0 = load, 1 = extension
+    for s in m.samples(timeout=5):          # s.source: 0 = load (N), 1 = extension (mm)
         print(f"{s.t:8.3f}s  src{s.source}  {s.value:.6g}")
 ```
+
+`info` and `log` connect without setting up test control, so they send only link
+handshake and query traffic.
+
+## Test control
+
+**This moves the crosshead.** It has only run against the simulator, so keep a hand on
+the emergency stop the first time. An LR/LRX Plus with a keypad must be set to
+Remote Control first.
+
+```
+uv run lloydplus move --port /dev/ttyUSB0 --to 10 --speed 50          # to 10 mm at 50 mm/min
+uv run lloydplus move --port /dev/ttyUSB0 --load 200 --speed 20 --hold 30
+uv run lloydplus zero --port /dev/ttyUSB0                             # zero load and extension
+uv run lloydplus home --port /dev/ttyUSB0                             # back to 0 mm, max speed
+```
+
+Each command takes control, does its job, then stops and hands control back. Ctrl+C
+during a move stops the crosshead. Grip protection defaults to the frame's load range;
+set it with `--tensile-limit` / `--compressive-limit` (N).
+
+From Python (units: mm, N, mm/s, N/s, s):
+
+```python
+from lloydplus import Drive, LloydPlus
+
+with LloydPlus("/dev/ttyUSB0") as m:
+    c = m.control                            # None if the machine has no stage services
+    c.take_control(tensile_limit=500, compressive_limit=500)
+    c.zero()
+    seg = c.start(Drive.to_extension(20.0, 50 / 60, hold=10.0),   # 20 mm at 50 mm/min, hold 10 s
+                  next_drive=Drive.to_extension(0.0, 5.0))        # then back, no pause
+    while not seg.wait(0.5):
+        print(m.load, m.extension)
+    c.stop()
+    c.return_to_zero()
+# leaving the block stops and releases control
+```
+
+* **Limits** are absolute (from the last zero). `Drive.to_load` uses a load limit;
+  `Drive.at_load_rate` drives at N/s and needs the machine's LoadRate option.
+* **Direction** comes from the limit; speeds are always positive.
+* **Pre-empting:** starting a new segment pre-empts the running one, as in NEXYGEN.
+* **Break detection** is a PC-side job in NEXYGEN as well: watch the readings and call
+  `c.stop()`.
+
+How this maps onto the wire, and where it differs from the original console, is in
+PROTOCOL.md §11.
 
 ## Layout
 
@@ -68,8 +116,9 @@ with LloydPlus("/dev/ttyUSB0") as m:
 | `channels.py` | channel multiplexer, opening services by name |
 | `services.py` | Version, Description, TensileParameters, DataInformation, DataSet readings, StatusInformation, watchdog, SetSystemTime, PC-side services |
 | `machine.py` | `LloydPlus`: connect sequence and the high-level API |
-| `sim.py` | machine-side simulator used by the tests |
-| `cli.py` | `sniff`, `info`, `log` |
+| `stages.py` | test control: stage arena, stage-factory encoders, `StageControl`, `Drive` |
+| `sim.py` | machine-side simulator used by the tests (including a stage engine and a crosshead/sample model) |
+| `cli.py` | `sniff`, `info`, `log`, `move`, `zero`, `home` |
 | `re/` | the reverse-engineering scripts (RTTI vtable recovery, Ghidra decompile and naming, string-table dump); see PROTOCOL.md §14 |
 
 ## Tests

@@ -9,9 +9,11 @@ from .framing import FrameDecoder, crc16_arc, encode_frame
 from .link import Link
 from .machine import LloydPlus, open_serial
 from .services import DataSourceInfo, MachineMessage, MachineParameters, Sample
+from .stages import Drive, Segment, StageControl, StageError
 
 __all__ = [
     "ChannelMux", "ServiceClient", "ServiceOpenError", "FrameDecoder", "crc16_arc",
     "encode_frame", "Link", "LloydPlus", "open_serial", "DataSourceInfo",
-    "MachineMessage", "MachineParameters", "Sample",
+    "MachineMessage", "MachineParameters", "Sample", "Drive", "Segment", "StageControl",
+    "StageError",
 ]

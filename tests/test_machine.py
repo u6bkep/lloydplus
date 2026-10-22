@@ -23,9 +23,9 @@ def test_connect_and_info(pair):
     assert m.version == (2, 1, 7)
     assert m.description == ("LF", "LF Plus", "Lloyd Instruments LF Plus")
     assert m.parameters.load_range == 1000.0
-    assert m.parameters.max_speed == pytest.approx(0.0166667)
+    assert m.parameters.max_speed == pytest.approx(33.8667)
     assert [(s.index, s.kind, s.name, s.range) for s in m.sources] == [
-        (0, 1, "Load", 1000.0), (1, 2, "Extension", 1.1)]
+        (0, 1, "Load", 1000.0), (1, 2, "Extension", 1100.0)]
     assert sim.system_time is not None and sim.system_time.endswith(b"\0\0")
 
 
@@ -42,8 +42,11 @@ def test_stream(pair):
     exts = [s for s in got if s.source == 1]
     assert loads and exts
     assert loads[0].ticks == 10 and loads[1].ticks == 20
-    assert exts[3].raw == 15 and exts[3].value == pytest.approx(15e-6)
-    assert m.extension is not None
+    assert exts[3].raw == 0 and exts[3].value == 0.0
+    sim.position = 1.5                       # mm; load follows at 10 N/mm
+    time.sleep(0.2)
+    assert m.extension == pytest.approx(1.5)
+    assert m.load == pytest.approx(15.0)
 
 
 def test_status_and_watchdog(pair):

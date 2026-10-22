@@ -1,4 +1,4 @@
-"""Command line: ``lloydplus {sniff,info,log}``."""
+"""Command line: ``lloydplus {sniff,info,log,move,zero,home}``."""
 
 from __future__ import annotations
 
@@ -68,17 +68,18 @@ def cmd_sniff(args) -> int:
     return 0
 
 
-def _connect(args):
+def _connect(args, control: bool = True):
+    """``control=False`` keeps to link handshake and queries (no stage setup)."""
     from .machine import LloydPlus
     m = LloydPlus(args.port, rtscts=not args.no_rtscts)
     m.on_message(lambda msg: print(f"# machine {msg.source}: {msg.code} {msg.description}",
                                    file=sys.stderr))
-    m.connect(timeout=args.timeout)
+    m.connect(timeout=args.timeout, control=control)
     return m
 
 
 def cmd_info(args) -> int:
-    m = _connect(args)
+    m = _connect(args, control=False)
     try:
         print("version     :", ".".join(map(str, m.version)))
         print("description :", " | ".join(m.description))
@@ -94,7 +95,7 @@ def cmd_info(args) -> int:
 
 
 def cmd_log(args) -> int:
-    m = _connect(args)
+    m = _connect(args, control=False)
     names = {s.index: (s.name or f"source{s.index}") for s in m.sources}
     out = open(args.csv, "w", newline="") if args.csv else sys.stdout
     w = csv.writer(out)
@@ -115,6 +116,75 @@ def cmd_log(args) -> int:
     return 0
 
 
+def _take_control(args, m) -> None:
+    if m.control is None:
+        raise SystemExit("this machine did not offer the stage services; no test control")
+    rated = m.parameters.load_range
+    m.control.take_control(
+        tensile_limit=args.tensile_limit if args.tensile_limit is not None else rated,
+        compressive_limit=args.compressive_limit if args.compressive_limit is not None else rated)
+
+
+def _readings(m) -> str:
+    load, ext = m.load, m.extension
+    return (f"load {load:10.3f} N   extension {ext:10.4f} mm"
+            if load is not None and ext is not None else "(no readings yet)")
+
+
+def cmd_move(args) -> int:
+    from .stages import Drive
+    if (args.to is None) == (args.load is None):
+        raise SystemExit("give exactly one of --to MM or --load N")
+    speed = args.speed / 60.0
+    drive = (Drive.to_extension(args.to, speed, args.hold) if args.to is not None
+             else Drive.to_load(args.load, speed, args.hold))
+    m = _connect(args)
+    try:
+        _take_control(args, m)
+        seg = m.control.start(drive)
+        print(f"moving: {drive}  (Ctrl+C stops)", file=sys.stderr)
+        try:
+            while not seg.wait(0.5):
+                print(_readings(m), flush=True)
+        except KeyboardInterrupt:
+            print("stopping", file=sys.stderr)
+            m.control.stop()
+        print(f"done ({seg.reason}): {_readings(m)}")
+    finally:
+        m.close()           # stops and releases control
+    return 0
+
+
+def cmd_zero(args) -> int:
+    m = _connect(args)
+    try:
+        _take_control(args, m)
+        m.control.zero()
+        time.sleep(0.5)
+        print(_readings(m))
+    finally:
+        m.close()
+    return 0
+
+
+def cmd_home(args) -> int:
+    m = _connect(args)
+    try:
+        _take_control(args, m)
+        print("returning to 0 mm at maximum speed (Ctrl+C stops)", file=sys.stderr)
+        try:
+            m.control.return_to_zero(wait=False)
+            while m.control.slot != 7:
+                print(_readings(m), flush=True)
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            m.control.stop()
+        print(_readings(m))
+    finally:
+        m.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="lloydplus")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -128,7 +198,10 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(func=cmd_sniff)
 
     for name, func, hlp in (("info", cmd_info, "connect and print machine information"),
-                            ("log", cmd_log, "stream readings to CSV")):
+                            ("log", cmd_log, "stream readings to CSV"),
+                            ("move", cmd_move, "drive the crosshead to an extension or load"),
+                            ("zero", cmd_zero, "zero the load and extension readings"),
+                            ("home", cmd_home, "return the crosshead to 0 mm")):
         p = sub.add_parser(name, help=hlp)
         p.add_argument("--port", required=True)
         p.add_argument("--timeout", type=float, default=10.0)
@@ -137,6 +210,17 @@ def main(argv: list[str] | None = None) -> int:
         if name == "log":
             p.add_argument("--csv")
             p.add_argument("--seconds", type=float)
+        if name in ("move", "zero", "home"):
+            p.add_argument("--tensile-limit", type=float, metavar="N",
+                           help="grip protection, tension (default: frame load range)")
+            p.add_argument("--compressive-limit", type=float, metavar="N",
+                           help="grip protection, compression (default: frame load range)")
+        if name == "move":
+            p.add_argument("--to", type=float, metavar="MM", help="extension limit, mm")
+            p.add_argument("--load", type=float, metavar="N", help="load limit, N")
+            p.add_argument("--speed", type=float, required=True, metavar="MM_PER_MIN")
+            p.add_argument("--hold", type=float, default=0.0, metavar="S",
+                           help="hold at the limit for S seconds")
         p.set_defaults(func=func)
 
     args = ap.parse_args(argv)

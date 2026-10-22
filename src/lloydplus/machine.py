@@ -8,6 +8,7 @@ import threading
 from typing import Callable
 
 from . import services as svc
+from . import stages
 from .channels import ChannelMux, ServiceClient, ServiceOpenError
 from .link import Link, Port
 
@@ -56,10 +57,11 @@ class LloydPlus:
 
     def __init__(self, port: str | Port, *, rtscts: bool = True, dtr: bool = False,
                  on_message: Callable[[svc.MachineMessage], None] | None = None,
-                 watchdog_interval: float = 10.0) -> None:
+                 watchdog_interval: float = 10.0, extension_source: int = 1) -> None:
         self._own_port = isinstance(port, str)
         self.port = open_serial(port, rtscts=rtscts, dtr=dtr) if isinstance(port, str) else port
         self.watchdog_interval = watchdog_interval
+        self.extension_source = extension_source
         self._message_cbs: list[Callable[[svc.MachineMessage], None]] = []
         if on_message:
             self._message_cbs.append(on_message)
@@ -83,6 +85,7 @@ class LloydPlus:
         self._watchdog: svc.Watchdog | None = None
         self.responder: ServiceClient | None = None
         self.keypad: ServiceClient | None = None
+        self.control: stages.StageControl | None = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -123,11 +126,15 @@ class LloydPlus:
     # -- connection -------------------------------------------------------
 
     def connect(self, timeout: float = 10.0, *, stream: bool = True,
-                set_clock: bool = True) -> "LloydPlus":
+                set_clock: bool = True, control: bool = True) -> "LloydPlus":
         """Bring up the link and the services, in the console's order
         (CNextStepMachineVisitor): Responder + NotImplementedDataSources,
         KeypadEZ, SetSystemTime, watchdog, Description, Version,
-        StatusInformation, TensileParameters, DataInformation -> DataSet."""
+        StatusInformation, TensileParameters, DataInformation -> DataSet,
+        then the stage arena and factories (:attr:`control`).
+
+        Setting up test control installs stages but moves nothing.  If the
+        machine lacks the stage services, :attr:`control` stays None."""
         self.link.start()
         if not self.link.wait_connected(timeout):
             raise TimeoutError(
@@ -154,7 +161,20 @@ class LloydPlus:
         self.sources = svc.query_data_information(m)
         if stream:
             self.start_stream()
+        if control:
+            self._setup_control()
         return self
+
+    def _setup_control(self) -> None:
+        p = self.parameters
+        try:
+            self.control = stages.StageControl(
+                self.mux, min_speed=p.min_speed, max_speed=p.max_speed,
+                sources=[s.index for s in self.sources],
+                extension_source=self.extension_source)
+        except ServiceOpenError as e:
+            log.warning("test control unavailable: %s", e)
+            self.control = None
 
     def _try_open(self, name: str) -> ServiceClient | None:
         try:
@@ -176,6 +196,16 @@ class LloydPlus:
             self._stream = None
 
     def close(self) -> None:
+        """Disconnect.  If the PC has control, stop and hand control back first."""
+        if self.control is not None:
+            try:
+                if self.control.in_control:
+                    self.control.stop(timeout=2.0)
+                    self.control.release_control(timeout=5.0)
+            except Exception as e:
+                log.warning("could not stop/release before closing: %s", e)
+            self.control.close()
+            self.control = None
         if self._watchdog:
             self._watchdog.stop()
         try:

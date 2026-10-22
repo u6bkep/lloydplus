@@ -3,6 +3,11 @@
 It implements the machine side as understood from the PC console's code, so
 it validates this library's self-consistency, not the real firmware.  Its
 link layer is the same symmetric :class:`~lloydplus.link.Link`.
+
+The stage engine follows the model in PROTOCOL.md §11: ``next`` is followed
+when a stage completes, ``active`` is applied when it is written.  The
+mechanics are a crosshead at ``position`` mm pressing a linear sample of
+``stiffness`` N/mm (load = stiffness * position).
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ import time
 
 from .channels import ChannelMux
 from .link import Link
+from .services import atof
+from . import stages as st
 
 
 class PipePort:
@@ -49,10 +56,29 @@ def port_pair() -> tuple[PipePort, PipePort]:
     return PipePort(a, b), PipePort(b, a)
 
 
+# What each factory's stage does in the simulator
+_INSTANT = {st.GRIP_PROTECTION, st.SET_AUTO_STIFFNESS, st.SET_MANUAL_STIFFNESS,
+            st.SET_DATASOURCE_RANGE, st.RELEASE_EXCLUSIVE}
+_MOTION = {st.CROSSHEAD_RATE, st.CROSSHEAD_POSITIONING, st.LOAD_RATE}
+
+
+def parse_motion(p: bytes) -> tuple[float, int, float, int, float]:
+    """Inverse of :func:`lloydplus.stages.motion_stage` (without the slot)."""
+    rate, rest = p.split(b"\0", 1)
+    src, rest = rest[0], rest[1:]
+    limit, rest = rest.split(b"\0", 1)
+    strain, gauge = rest[0], rest[1:].split(b"\0", 1)[0]
+    return atof(rate), src, atof(limit), strain, atof(gauge)
+
+
 class SimMachine:
+    TICK = 0.01        # s of simulated time per step (also one reading per source)
+
     def __init__(self, port, *, version=(2, 1, 7),
                  descriptions=("LF", "LF Plus", "Lloyd Instruments LF Plus"),
-                 sample_period_ticks: int = 10) -> None:
+                 sample_period_ticks: int = 10, stiffness: float = 10.0,
+                 remote: bool = True,
+                 fitted: set[str] | None = None) -> None:
         self.version = bytes(version)
         self.descriptions = descriptions
         self.sample_period_ticks = sample_period_ticks
@@ -61,15 +87,35 @@ class SimMachine:
         self.status_channel: int | None = None
         self.keypad: list[int] = []
         self.system_time: bytes | None = None
-        self.load_counts = 0.0
-        self._stream_stop = threading.Event()
-        self._stream_thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
         self.sources = [
             # index, kind, extra, a, b, name
             (0, 1, 0, "-1000", "1000", "Load"),
-            (1, 2, 0, "-1.1", "1.1", "Extension"),
+            (1, 2, 0, "-1100", "1100", "Extension"),
         ]
-        self.scales = {0: "0.01", 1: "0.000001"}
+        self.scales = {0: 0.01, 1: 0.001}      # N/count, mm/count
+        self.parameters = ("1000", "1100", "0.000166667", "33.8667")   # N, mm, mm/s, mm/s
+        # mechanics
+        self.stiffness = stiffness
+        self.position = 0.0                     # mm, absolute
+        self.zero = {0: 0.0, 1: 0.0}            # readings subtracted after Zero
+        self.remote = remote                    # frame set to Remote Control
+        # stage engine
+        self.fitted = set(st.MANDATORY_FACTORIES) | set(
+            st.OPTIONAL_FACTORIES if fitted is None else fitted)
+        self.stages: dict[int, tuple[str, bytes]] = {}
+        self.next = list(range(st.ARENA_SLOTS))
+        self.active = list(range(st.ARENA_SLOTS))
+        self.current = 0
+        self.notify_channel: int | None = None
+        self.transitions: list[tuple[int, int]] = []
+        self.factory_packets: list[tuple[str, bytes]] = []
+        self.arena_packets: list[bytes] = []
+        self.grip_limits: tuple[float, float] | None = None
+        self._channels: list[int] = []
+        self._rezero: set[int] = set()
         self._install()
 
     def _on_data(self, data: bytes) -> None:
@@ -77,10 +123,114 @@ class SimMachine:
 
     def start(self) -> None:
         self.link.start()
+        self._thread = threading.Thread(target=self._run, name="sim-machine", daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
-        self._stream_stop.set()
+        self._stop.set()
         self.link.stop()
+
+    # -- mechanics and readings ---------------------------------------------
+
+    @property
+    def load(self) -> float:
+        return self.stiffness * self.position
+
+    def reading(self, index: int) -> float:
+        raw = self.load if index == 0 else self.position
+        return raw - self.zero.get(index, 0.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.TICK):
+            with self._lock:
+                self._step(self.TICK)
+                self._emit()
+
+    def _emit(self) -> None:
+        for i, ch in enumerate(self._channels):
+            if i in self._rezero:
+                self._rezero.discard(i)
+                self.mux.send(ch, b"\x02" + (0).to_bytes(4, "big", signed=True))
+                self._prev[i] = 0
+            counts = int(round(self.reading(i) / self.scales.get(i, 1.0)))
+            d = max(-32768, min(32767, counts - self._prev[i]))
+            self._prev[i] += d
+            self.mux.send(ch, b"\x00" + d.to_bytes(2, "big", signed=True))
+
+    # -- stage engine -------------------------------------------------------
+
+    def _goto(self, slot: int) -> None:
+        for _ in range(64):              # instant stages chain through `next`
+            old, self.current = self.current, slot
+            self.transitions.append((old, slot))
+            if self.notify_channel is not None:
+                self.mux.send(self.notify_channel, bytes((0, old, slot)))
+            if not self._enter(slot):
+                return
+            slot = self.next[slot]
+        raise RuntimeError("stage loop")
+
+    def _enter(self, slot: int) -> bool:
+        """Run the entry action of ``slot``; True if it completed at once."""
+        kind, p = self.stages.get(slot, (None, b""))
+        if kind in _INSTANT:
+            if kind == st.GRIP_PROTECTION:
+                t, c = p.split(b"\0")[:2]
+                self.grip_limits = (atof(t), atof(c))
+            return True
+        if kind == st.ZERO_READINGS:
+            for i, m in enumerate(p):
+                if m == 0xFF:
+                    self.zero[i] = (self.load if i == 0 else self.position)
+                    self._rezero.add(i)
+            return True
+        if kind == st.GAIN_EXCLUSIVE:
+            return self.remote
+        if kind == st.WAIT_EXCLUSIVE:
+            return self.remote
+        if kind == st.WAIT_SHARED:
+            return not self.remote
+        if kind in _MOTION:
+            return self._motion_done(p, 0.0)
+        return False                     # empty slot, DoNothing, DriveNowhere: idle
+
+    def _motion_done(self, p: bytes, dt: float) -> bool:
+        rate, src, limit, _strain, _gauge = parse_motion(p)
+        kind = self.stages[self.current][0]
+        if rate == 0:
+            return False                 # a hold never completes by itself
+        speed = rate / self.stiffness if kind == st.LOAD_RATE else rate   # mm/s
+        here = self.reading(src)
+        gap = limit - here
+        per_mm = self.stiffness if src == 0 else 1.0
+        step = speed * dt * per_mm
+        if abs(gap) <= max(step, 1e-9):
+            self.position += gap / per_mm
+            return True
+        self.position += math.copysign(speed * dt, gap)
+        return False
+
+    def _step(self, dt: float) -> None:
+        kind, p = self.stages.get(self.current, (None, b""))
+        if kind in _MOTION and self._motion_done(p, dt):
+            self._goto(self.next[self.current])
+        elif kind == st.WAIT_EXCLUSIVE and self.remote:
+            self._goto(self.next[self.current])
+        elif kind == st.WAIT_SHARED and not self.remote:
+            self._goto(self.next[self.current])
+
+    def _on_arena(self, p: bytes) -> None:
+        self.arena_packets.append(p)
+        if len(p) == 2 and p[0] == 0:
+            self.notify_channel = p[1]
+            return
+        if len(p) < 4 or p[0] not in (1, 2) or p[1] != len(p) - 3:
+            return
+        count, start, values = p[1], p[2], p[3:]
+        table = self.active if p[0] == 1 else self.next
+        table[start:start + count] = list(values)
+        if p[0] == 1 and self.active[self.current] != self.current:
+            self._goto(self.active[self.current])
 
     # -- services ---------------------------------------------------------
 
@@ -109,7 +259,7 @@ class SimMachine:
             return best.encode()
 
         def parameters(p):
-            return b"\0".join(s.encode() for s in ("1000", "1.1", "0.0000002", "0.0166667")) + b"\0\0"
+            return b"\0".join(s.encode() for s in self.parameters) + b"\0\0"
 
         def data_information(p):
             for idx, kind, extra, a, b, name in self.sources:
@@ -127,6 +277,24 @@ class SimMachine:
             def h(p):
                 self._start_stream(list(p))
             return h
+
+        def locked(fn):
+            def h(p):
+                with self._lock:
+                    fn(p)
+            return h
+
+        def arena(mux, _r):
+            return locked(self._on_arena)
+
+        def factory(name):
+            def make(mux, _r):
+                def h(p):
+                    self.factory_packets.append((name, bytes(p)))
+                    if p:
+                        self.stages[p[0]] = (name, bytes(p[1:]))
+                return locked(h)
+            return make
 
         def responder(mux, _r):
             def h(p):
@@ -153,7 +321,10 @@ class SimMachine:
             "NotImplementedDataSources": lambda mux, r: (lambda p: None),
             "KeypadEZ": keypad,
             "SetSystemTime": set_time,
+            st.ARENA_SERVICE: arena,
         })
+        for name in self.fitted:
+            m.local_services[name] = factory(name)
 
     def push_status(self, code: int, text: str = "") -> None:
         if self.status_channel is None:
@@ -161,24 +332,18 @@ class SimMachine:
         self.mux.send(self.status_channel, bytes(((code >> 8) & 0xFF, code & 0xFF)) + text.encode())
         self.mux.send(self.status_channel, b"")
 
+    def set_remote(self, remote: bool) -> None:
+        """Flip the frame between Local and Remote Control."""
+        with self._lock:
+            self.remote = remote
+            self._step(0.0)
+
     def _start_stream(self, channels: list[int]) -> None:
-        def run():
-            mux, n = self.mux, self.sample_period_ticks
+        with self._lock:
+            n = self.sample_period_ticks
             for i, ch in enumerate(channels):
-                mux.send(ch, b"\x04" + self.scales.get(i, "1").encode() + b"\0")
-                mux.send(ch, b"\x03" + n.to_bytes(2, "big"))
-                mux.send(ch, b"\x02" + (12345).to_bytes(4, "big", signed=True))
-            prev = [0] * len(channels)
-            k = 0
-            while not self._stream_stop.wait(0.02):
-                for i, ch in enumerate(channels):
-                    deltas = bytearray()
-                    for j in range(4):
-                        x = int(round(1000 * math.sin((k + j) / 20.0))) if i == 0 else (k + j) * 5
-                        d = x - prev[i]
-                        prev[i] = x
-                        deltas += d.to_bytes(2, "big", signed=True)
-                    mux.send(ch, b"\x00" + bytes(deltas))
-                k += 4
-        self._stream_thread = threading.Thread(target=run, name="sim-stream", daemon=True)
-        self._stream_thread.start()
+                self.mux.send(ch, b"\x04" + repr(self.scales.get(i, 1.0)).encode() + b"\0")
+                self.mux.send(ch, b"\x03" + n.to_bytes(2, "big"))
+                self.mux.send(ch, b"\x02" + (12345).to_bytes(4, "big", signed=True))
+            self._prev = [0] * len(channels)
+            self._channels = channels

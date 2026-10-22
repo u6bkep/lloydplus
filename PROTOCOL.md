@@ -20,7 +20,7 @@ Confidence by area:
 | Transport (§2–§6) | High. An independent second pass compared it byte for byte with the binary, and the discrepancies found were fixed in the library. |
 | Services and readings (§7–§9) | High for byte layouts. Medium for the meaning of some fields. |
 | Units (§10) | High: N, mm, s, read from the console's unit constants. One hardware check still worthwhile. |
-| Test control / stages (§11) | High for byte layouts and the console's slot map. Medium for some stage semantics (marked "inferred"). Not implemented in `lloydplus`. |
+| Test control / stages (§11) | High for byte layouts and the console's slot map. Medium for some stage semantics (marked "inferred"). Implemented in `lloydplus.stages`, tested only against the simulator. |
 
 ### Source binary
 
@@ -596,9 +596,10 @@ How this was established:
 
 ## 11. Test control (stages)
 
-Not implemented in `lloydplus`. Everything here is read from `LrCon.exe`; the byte
-layouts are checked against the disassembly wherever Ghidra dropped call arguments.
-Semantics that are inferred rather than read are marked **(inferred)**.
+Implemented in `lloydplus.stages` (§11.9 lists where it differs from the console).
+Everything here is read from `LrCon.exe`; the byte layouts are checked against the
+disassembly wherever Ghidra dropped call arguments. Semantics that are inferred rather
+than read are marked **(inferred)**.
 
 ### 11.1 Model
 
@@ -612,11 +613,15 @@ Semantics that are inferred rather than read are marked **(inferred)**.
 * **Two 32-entry tables** in `StageArenaReference5` decide what runs next:
   * `next[i]`: where the machine goes when the stage in slot i **completes** by
     itself (e.g. the limit is reached).
-  * `active[i]`: a **redirect**. While the current slot is i and `active[i] != i`, the
-    machine leaves i for `active[i]` at once, whether or not the stage has completed.
-    `active[i] == i` means "no redirect" **(inferred** from how the console writes the
-    table: every bulk write keeps `active[i] = i` for slots it must not disturb, and
-    Stop is a write of `active[running slots] = 7`).
+  * `active[i]`: a **redirect**. When the table is written and the current slot i
+    has `active[i] != i`, the machine leaves i for `active[i]` at once, whether or not
+    the stage has completed. `active[i] == i` means "no redirect" **(inferred** from
+    how the console writes the table: every bulk write keeps `active[i] = i` for slots
+    it must not disturb, and Stop is a write of `active[running slots] = 7`).
+  * The redirect is applied **when written, not re-checked when a slot is entered**
+    **(inferred)**. Zero writes `active[7] = 9`, and slot 9's `next` is 7. If entry
+    re-checked `active`, the machine would loop 7 → 9 → 7 forever; ReturnToZero would
+    loop through 10 the same way.
 * **Reports.** The machine reports every slot change `(old, new)` to the PC. Nothing
   else in the stage subsystem flows machine → PC.
 * **Done on the PC, not the machine:** hold timing (§11.6), break detection (§11.7),
@@ -718,7 +723,13 @@ Further details:
 
 * **Speed clamping.** When the rate is a velocity and `strain_src` is none, the console
   first limits it with 0x428790. That uses the machine's MinSpeed/MaxSpeed (vtable
-  slots 46/47, ultimately `TensileParameters`). The exact rule near zero was not decoded.
+  slots 46/47, ultimately `TensileParameters`). The rule is:
+  * above MaxSpeed → MaxSpeed;
+  * above MinSpeed → unchanged;
+  * above MinSpeed/10 → MinSpeed;
+  * otherwise → **0**.
+
+  So a rate-0 hold really is sent as 0.
 * **True strain.** The unit of the strain rate was not resolved. As written, 0x4282f0
   would convert a 1/s rate as N/s and throw. So either the automation layer passes it
   differently, or that path is unused by this console.
@@ -923,6 +934,27 @@ machine → notify      00 10 13            (16 → 19: limit reached, DriveNowh
 | 20–31 | error "Unexpected stage entered" |
 
 Independently, leaving slot 11 (`old == 11`) hides the cancel-return dialog.
+
+### 11.9 `lloydplus.stages` versus the console
+
+`StageControl` sends the console's packets, with these deliberate differences:
+
+* **Too-slow speeds.** A speed that the clamp would turn into 0 raises `ValueError`
+  instead of being sent as a non-moving drive. A clamp to MaxSpeed is logged.
+* **Hold expiry.** When a hold time expires, it writes `active[b+1] = b+2` (or `b+3`).
+  The machine then moves on to the next drive or the stop slot. The console sends
+  nothing and leaves the machine holding (§11.7), so a Next after a hold would never
+  run.
+* **Failed take-control.** After GainExclusive fails (slot 0), it re-writes
+  `active[0] = 2` so the machine goes back to the wait loop and a retry can work.
+* **Stop before Zero/ReturnToZero.** If a segment is running or finished in a bank,
+  Zero and ReturnToZero issue Stop first. The console requires the script to do it.
+* **Release on close.** `LloydPlus.close()` stops and releases control if the PC holds
+  it.
+* **Not offered:** TrueStrainRate stages (unit unresolved), the cancel-return slot 11
+  flow, and the extension-source ranging check at connect (§11.4 step 5).
+* **Stage setup is opt-in for `info` / `log`.** The CLI's read-only commands connect
+  with `control=False`, so they still send only handshake and query traffic.
 
 ## 12. Console messages relevant to the link
 
