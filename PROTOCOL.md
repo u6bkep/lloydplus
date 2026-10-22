@@ -43,12 +43,24 @@ NEXYGEN.
 Older LR / LRX / LF500 (non-Plus) machines use a different console, `LrLrxCon.exe`. That
 console is **not** covered here.
 
+### Reference documents
+
+Vendor documents cited here (not included in this repository):
+
+| short name | document |
+|---|---|
+| LR/EZ manual | *LR_Plus Series and EZ Series Universal Test Machine User Manual*, Lloyd Instruments, Part No. 01/3461, May 2014 (`dual_column_test_stands_lr_and_ez_manual_english.pdf`) |
+| Plus service manual | *Lloyd Instruments Plus Series Service Manual*, issue 10 (`service-manuals-plus-series-issue-10.pdf`), covering the LF Plus. Claims attributed to it here come from an earlier summary of it and have not been re-checked against the document. |
+| Automation manual | *Controlling NEXYGEN V4.0 using Excel*, part 01/2987 (on the NEXYGEN 4.1 CD) |
+
 ### Machine compatibility
 
 NEXYGEN 4.1 lists the LRX Plus, EZ20 and EZ50 as the "Easy Test Series" it supports
-("NEXYGEN V4.1 and Ondio V4.1" manual §1.2). The LF Plus isn't named. The Plus-series
-service manual (as quoted in the original handover) says NEXYGEN talks to the LF Plus
-at 57600 8N1, which is consistent with this protocol. It's still possible that later
+("NEXYGEN V4.1 and Ondio V4.1" manual §1.2). The LF Plus isn't named. The Plus service
+manual (second-hand, see Reference documents) says the LF Plus talks to NEXYGEN and
+firmware upgrades at 57600 8N1, and sends printer/datalogger output at 9600 8N1. The
+LR/EZ manual §11.10 gives 57600 8N1 for the PC link. Both are consistent with this
+protocol. It's still possible that later
 LF Plus firmware expects the newer NEXYGENPlus console.
 
 ## 1. Physical layer
@@ -92,11 +104,11 @@ inputs floating. The PC console then never transmits. The machine probably doesn
 either, if it honours CTS; that is unverified. The printer lead (09/0721) is wired
 differently and isn't for PC use.
 
-### Practical constraints from the manuals and handover
+### Practical constraints from the manuals
 
 * After a PC session, the frame's own "Print" is refused until power-cycle ("Print
   unavailable. Power down and retry", LR/EZ manual §9).
-* According to the Plus service manual (as summarised in the handover), the
+* According to the Plus service manual (second-hand, see Reference documents), the
   bootloader listens for `++-` in the first ~2 s after power-on. Don't transmit in
   that window.
 * Only one program can own the COM port. Don't run NEXYGEN alongside another client.

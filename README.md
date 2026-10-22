@@ -39,9 +39,10 @@ simply be waiting for the PC to speak first. The next step is then `info`, which
 does transmit (only link-handshake and query traffic, no motion).
 
 Don't run NEXYGEN at the same time (one program per COM port). After a PC session,
-the frame's own Print function is disabled until power-cycle (user manual, "Print
-unavailable"). The Plus service manual warns that the bootloader listens for `++-`
-in the first ~2 s after power-on, so don't connect during that window.
+the frame's own Print function is disabled until power-cycle (LR/EZ user manual §9,
+"Print unavailable"). The Plus Series Service Manual reportedly says the bootloader
+listens for `++-` in the first ~2 s after power-on, so don't connect during that
+window. PROTOCOL.md §0 lists the vendor documents by name.
 
 ## Read information and log readings
 
