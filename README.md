@@ -5,13 +5,13 @@ Python driver for the RS-232 PC link of Lloyd Instruments "Plus" series test fra
 (`LrCon.exe`). The protocol was reverse engineered from NEXYGEN 4.1; see
 [PROTOCOL.md](PROTOCOL.md) for the wire format, with binary addresses as evidence.
 
-Status: built from static analysis and tested against the bundled protocol
-simulator. **This library has not yet talked to a real machine.** Parts of the
-analysis have, though: on 2026-10-22 a colleague drove an LF Plus through NEXYGEN's
-own console (`LrCon.exe`, via OLE) and confirmed the lead and CTS behaviour, that the
-LF Plus is an `LrCon` machine, and that direction comes from the limit. The same
-session showed that the console's own Stop does **not** halt a running drive; see
-"Test control" below and PROTOCOL.md §11.9 for what this library does instead.
+Status: built from static analysis, then run against an LF Plus (firmware 3.0.94,
+1 kN cell) on 2026-10-22. Verified on that machine, unchanged from the static
+analysis: the lead and CTS behaviour, the boot handshake and reliable transport, all
+service opens, machine information, readings at ~1 kHz per source, taking and
+releasing control, crosshead-rate segments, stop (both this library's sequence and the
+console's own write), and the transition reports. Not yet exercised on hardware: load
+limits, holds, next-drive chaining, return-to-zero, zero, the load-rate option.
 
 ## Wiring
 
@@ -46,7 +46,9 @@ the loop. Quirks seen on an LF Plus: the menu is headed "System selt test" (sic)
 lines end LF CR, there is an undocumented `X` to exit, and a second `test` toggles
 "tracing on/off" instead of reprinting the menu. `diag` sends `test` once, undoes an
 accidental toggle, and exits with `X`. Run it with the frame idle, not during a PC
-session.
+session. **Caveat:** on our LF Plus the menu did not answer after the frame had
+already been through a PC session; the colleague's result came from a freshly
+powered machine. Try it before the first `info` after power-on.
 
 ## First test: listen only
 
@@ -55,11 +57,10 @@ uv run lloydplus sniff --port /dev/ttyUSB0      # Windows: --port COM3
 ```
 
 `sniff` never writes to the port. It asserts RTS, so a machine that waits for CTS
-can talk. The PC console repeats `BOOT state=0` until it gets an answer. If the
-machine firmware does the same (likely, but unverified), a working cable shows a
-steady stream of `BOOT state=0` frames. If `sniff` shows nothing, the machine may
-simply be waiting for the PC to speak first. The next step is then `info`, which
-does transmit (only link-handshake and query traffic, no motion).
+can talk. An idle machine floods `BOOT state=0` frames at the full line rate (about
+990 six-byte frames a second), so a working cable shows them immediately. If `sniff`
+shows nothing, check the lead (pins 7–8). The next step is `info`, which does
+transmit (only link-handshake and query traffic, no motion).
 
 Don't run NEXYGEN at the same time (one program per COM port). After a PC session,
 the frame's own Print function is disabled until power-cycle (LR/EZ user manual §9,
@@ -88,18 +89,18 @@ handshake and query traffic.
 
 ## Test control
 
-**This moves the crosshead.** It has only run against the simulator, so keep a hand on
-the emergency stop the first time, and run the first moves in free air.
+**This moves the crosshead.** Keep a hand on the emergency stop the first time, and
+run the first moves in free air.
 
-Two things learned on hardware shape this section. First, the console's own Stop
-command (the same arena write the manual's `Console.Stop` sends) **did not halt a
-running drive** on an LF Plus; the crosshead ran on until the grip-protection load
-limit latched. Starting another stage did pre-empt it. So `stop()` here first
-redirects the running drive into the bank's DriveNowhere stage, then sends the
-console's Stop. That ordering is untested on hardware; until it is, treat Ctrl+C and
-`stop()` as unproven and keep the e-stop in reach. Second, grip protection is what
-actually ended those runaway moves, so the CLI defaults it to 10 % of the frame's load
-range (the console's factory default is 100 N either way).
+Verified on an LF Plus: taking control, a crosshead-rate segment (5.4 mm at 10 mm/min
+took 32.5 s against 32.4 s expected), and stopping. `stop()` sends two arena writes,
+first a redirect of the running drive into the bank's DriveNowhere stage and then the
+console's own Stop; the machine reported `16 → 19 → 7` within a millisecond and the
+head halted about 0.1 mm past the last reading. The console's write alone also stops
+the machine (`16 → 7` in 0.23 s), so a colleague's report that NEXYGEN's OLE `Stop`
+left the crosshead running points at the OLE path, not the firmware. Grip protection
+defaults to 10 % of the frame's load range (the console's factory default is 100 N
+either way); it is the backstop that ended those runaway moves.
 
 A Plus-series frame connects automatically; there is no Remote Control setting to
 make (that step belongs to the older LR/LRX/LF keypads, NEXYGEN manual ch. 5).
@@ -113,7 +114,8 @@ uv run lloydplus home --port /dev/ttyUSB0                             # back to 
 ```
 
 Each command takes control, does its job, then stops and hands control back. Ctrl+C
-during a move sends the stop sequence described above. Grip protection defaults to
+during a move stops the crosshead (verified), and a repeated Ctrl+C keeps stopping
+rather than aborting. Grip protection defaults to
 10 % of the frame's load range; set it with `--tensile-limit` / `--compressive-limit`
 (both positive, N). On a thin or stiff specimen the approach speed, not the load
 limit, is what protects it: at 10 mm/min a 2 N touch-off was detected at 2.2 N, at

@@ -12,11 +12,31 @@ This document was reverse engineered statically from the vendor's PC software. C
 carry the address of the code they come from, so anyone can re-check them. Where a
 claim is an inference rather than a reading of the code, it says so.
 
-**Hardware observations.** `lloydplus` itself has not yet run against a machine. On
-2026-10-22 a colleague drove an LF Plus (S/N LF1154, firmware "3.0 Issue 94", 1 kN
-cell) through NEXYGEN's own console, `LrCon.exe`, via its OLE interface (GitHub issue
-#1 on this repository). Since the console is the binary analysed here, what the
-machine did in that session is evidence about this protocol:
+**Hardware verification (2026-10-22).** `lloydplus` ran against an LF Plus
+(firmware 3.0.94, "LF Plus CS4921", 1 kN cell, 500 mm) over an FTDI adapter and a
+null-modem lead. Everything it exercised behaved as this document describes, with no
+change to the protocol code:
+
+* boot handshake, reliable transport and all service opens (§4–§8), including the
+  stage factories; `Version` 3.0.94, `TensileParameters` 1000 N / 500 mm /
+  0.000833–21.17 mm/s, `DataInformation` records for load and extension;
+* `DataSet` streaming at 1024 samples/s per source with 1 ms spacing (§9);
+* take control (`1 → 3 → 4 → 5 → 7`), a crosshead-rate segment (`7 → 16`, limit
+  reached `16 → 19` after 32.5 s for 5.4 mm at 10 mm/min, 32.4 s expected), stop
+  (`16 → 19 → 7`), release (`7 → 8 → 1`) (§11);
+* the console's own Stop write, sent alone during a drive, also stops the machine:
+  `16 → 7` after 0.23 s, head stationary afterwards (§11.1, §11.9);
+* a write that covers the current slot re-enters it even when `active[i] == i`
+  (`19 → 19`, `7 → 7` reports) (§11.1);
+* the firmware's RAW frames carry trace text (§4), an idle machine floods BOOT frames
+  at line rate (§4.1), and it drops a silent PC after about 4 s (§8.2).
+
+Not yet exercised on hardware: load limits, holds, Next, ReturnToZero, Zero, the
+LoadRate option, grip protection actually latching, the behaviour of slots 0 and 11.
+
+Earlier the same day a colleague had driven the same machine through NEXYGEN's own
+console, `LrCon.exe`, via its OLE interface (GitHub issue #1 on this repository), which
+established:
 
 * the machine gates its transmitter on CTS (§1): silent with a 2↔3-only lead, answered
   first time with a null modem;
@@ -25,24 +45,25 @@ machine did in that session is evidence about this protocol:
 * direction comes from the limit, not from the console's tension/compression mode
   (§11.3);
 * compression reads as negative load and decreasing extension (§10);
-* **the console's Stop did not halt a running drive** (§11.5, §11.9), while starting
-  another stage pre-empted it;
+* NEXYGEN's OLE `Console.Stop` did not halt a running drive, while starting another
+  stage pre-empted it. Since the machine does stop on the arena write that call is
+  meant to send (above), the fault is in the OLE path (§11.5);
 * positioning and speed were accurate: 0.02 mm error after 42 mm of travel, 20.25 s
   for a 20 s move at 60 mm/min;
 * the self-test menu (§1, Practical constraints) works as the service manual says,
   with small differences.
 
-These are observations of the console's traffic, not captures of it. The wire-level
-details (§2–§9) still await a `sniff` capture.
+Those were observations of the console's behaviour, not captures of its traffic; the
+wire-level claims rest on the `lloydplus` run above.
 
 Confidence by area:
 
 | Area | Confidence |
 |---|---|
-| Transport (§2–§6) | High. An independent second pass compared it byte for byte with the binary, and the discrepancies found were fixed in the library. |
-| Services and readings (§7–§9) | High for byte layouts. Medium for the meaning of some fields. |
-| Units (§10) | High: N, mm, s, read from the console's unit constants. One hardware check still worthwhile. |
-| Test control / stages (§11) | High for byte layouts and the console's slot map. Medium for stage semantics (marked "inferred"); one of them, "a redirect into slot 7 stops a drive", was contradicted on hardware (§11.9). Implemented in `lloydplus.stages`, tested only against the simulator. |
+| Transport (§2–§6) | Verified on hardware. |
+| Services and readings (§7–§9) | Verified on hardware for everything the library uses. Medium for the meaning of some `DataInformation` fields. |
+| Units (§10) | Verified: mm and mm/s (a commanded 5.4 mm at 10 mm/min took 32.5 s and the extension reading moved 5.4 mm); N by the sign and magnitude of the readings against a known foam compression. |
+| Test control / stages (§11) | Verified on hardware: connect-time setup, take and release control, crosshead-rate segments, stop, transition reports. Inferred and still untested: holds, Next, load limits, ReturnToZero, Zero, slots 0 and 11. |
 
 ### Source binary
 
@@ -200,7 +221,7 @@ Code: `CMultiProtocol` 0x40c6e0, dispatch 0x40d090.
 | proto | name | handling on receipt |
 |---|---|---|
 | 0x02 | TRANSMISSION | reliable layer (§5). Ignored until the boot handshake is complete. |
-| 0x04 | RAW | discarded (0x40be40 → 0x40fe20) |
+| 0x04 | RAW | discarded by the console (0x40be40 → 0x40fe20). **The machine sends trace text in these:** `Growing` and `Maturing` as its link state rises, `Now idle` about every 250 ms while connected, `comm1 reset` when it drops the link (§8.2). `lloydplus` logs them. |
 | 0x05 | ECHO | the payload is sent back as **proto 0x04** (0x40c000), so echoes can't ping-pong |
 | 0x06, other | DISCARD | discarded |
 | 0xCE | BOOT | link handshake (§4.1) |
@@ -211,8 +232,9 @@ Code: `CBoot` 0x40b1e0. The transition table is at 0x44ec50: `{0,0,1, 1,3,3, 4,2
 
 Each side has a link state of 0, 1 or 2 (connected). While below 2, a side keeps
 sending `[0xCE, state]`. The PC sends it whenever its transmitter wants data (0x40d240),
-so in practice continuously. On receiving `[0xCE, rx]` with a 1-byte payload and
-`rx <= 2`:
+so in practice continuously. The machine does the same: an idle LF Plus floods
+`DC 60 54 02 CE 00` back to back at the full line rate, about 990 frames/s, whenever
+its CTS is asserted. On receiving `[0xCE, rx]` with a 1-byte payload and `rx <= 2`:
 
 | my state | rx | action |
 |---|---|---|
@@ -440,6 +462,13 @@ Code: 0x429e00, timer handler 0x429f00, reply handler 0x429fe0, send path 0x423c
   outstanding flag.
 * The first ping goes out 10 s after connecting. A machine has up to ~10 s to answer
   each one.
+* **The machine's side (observed).** After the PC goes quiet the LF Plus keeps the
+  session up for about 4 s, still streaming `DataSet` packets, then prints
+  `comm1 reset` (a RAW trace frame) and returns to boot state 0, flooding BOOT frames.
+  Closing the `DataSet` service does not stop the stream; only the reset does. In a
+  normal session the PC's acknowledgements of the 1 kHz stream keep the link busy; a
+  client that does not subscribe to readings must still send something within that
+  window. `lloydplus` therefore pings every 2 s instead of the console's 10 s.
 
 ### 8.3 `NotImplementedDataSources`
 
@@ -601,6 +630,9 @@ after the type byte.
   `scale = 0`. **Values read 0 until a type-4 scale message arrives.**
 * Sample output: `value = accum × scale` (N for load, mm for extension, §10), and time `= ticks × 0.9765625` (constant at
   0x43e9e8). So a tick is 1/1024 s and the product is milliseconds.
+* Observed on an LF Plus: both sources stream at 1024 samples/s (one sample per
+  tick), delivered in packets of 95–115 bytes about every 50 ms, each on its own
+  channel. NEXYGEN's OLE interface exposes the same data at 17–20 Hz by polling.
 
 Example (simulated) of a source being configured and then streaming:
 
@@ -690,15 +722,14 @@ than read are marked **(inferred)**.
       writes `active[3] = 0` while the machine is already in 7. If every write
       re-checked the current slot, that would bounce the machine straight back out of
       control on every test after the first.
-  * **A redirect out of a running motion stage into an empty slot does nothing**
-    **(observed, issue #1)**. The console's Stop writes `active[running] = 7`, and
-    slot 7 holds no stage. On an LF Plus that write left the crosshead driving until
-    its limit or the grip-protection latch; a redirect into a freshly created motion
-    stage (starting another segment) pre-empted it within 0.03 mm. Whether the
-    machine ignores the redirect, or follows it and keeps the motor running because
-    nothing told it otherwise, can't be told from outside; both readings give the same
-    rule for a client: to stop, redirect into a stage that stops (DriveNowhere),
-    §11.9. Whether a redirect *from* DriveNowhere into 7 works is untested.
+  * **Verified on hardware:** a write that covers the current slot makes the
+    machine enter `active[current]` at once, whether or not the stage has completed,
+    and **even when `active[i] == i`**: the machine then re-enters the same slot and
+    reports it (`19 → 19` after a Stop sent while sitting in DriveNowhere, `7 → 7`
+    after one sent from ready). So "no redirect" is only a property of slots a write
+    does not cover, not of identity entries. The console's Stop, `active[16] = 7`
+    sent during a drive, moved the machine `16 → 7` within 0.23 s and the crosshead
+    stopped there: an empty slot is a stopped machine.
 * **Reports.** The machine reports every slot change `(old, new)` to the PC. Nothing
   else in the stage subsystem flows machine → PC.
 * **Done on the PC, not the machine:** hold timing (§11.6), break detection (§11.7),
@@ -889,7 +920,7 @@ Notation: `A(start, [...])` = `[0x01, len, start, ...]` and `N(start, [...])` =
 |---|---|---|
 | **Take control** (`Console.Control`, start of a test) | slot 32, 0x426980 | see below |
 | **Release control** | slot 33, 0x426b20 | `A(0, [00 01 02 01 08 08 08 08 08 08 0B 0B 08×19 07])`: running slots → ReleaseExclusive (8); a return in progress (10, 11) → 11; GainExclusive → back to 1. Slot 31 → 7 is as found in the code |
-| **Stop** (`Console.Stop`) | slot 53, 0x427580 | cancel the hold timer; `A(0, [00 01 02 03 04 05 06 07 08 09 07 08, 07×20])`: segment slots and slot 10 → 7 (ready); slot 11 → 8. **On hardware this did not halt a running drive** (§11.1, §11.9). The OLE `Stop` (dispatch thunk 0x42cee0) and the GUI (`CLrMachine_v53`) both reach this same routine |
+| **Stop** (`Console.Stop`) | slot 53, 0x427580 | cancel the hold timer; `A(0, [00 01 02 03 04 05 06 07 08 09 07 08, 07×20])`: segment slots and slot 10 → 7 (ready); slot 11 → 8. Verified on hardware: sent alone during a drive it gives `16 → 7` and the head stops. The OLE `Stop` (dispatch thunk 0x42cee0, behind a precondition check at 0x42bb80 that throws if the console has no control) and the GUI (`CLrMachine_v53`) both reach this routine; the OLE call's failure to stop a drive in issue #1 therefore happened before this write was sent |
 | **Zero** (`Console.Zero`) | slot 51, 0x427570 | `A(7, [09])`. Only acts while in slot 7, which is why the manual says Stop first |
 | **ReturnToZero** | slot 50, 0x427550 | cancel the hold timer; `A(7, [0A])`. Only from slot 7, matching the manual's "only if the machine has been stopped" |
 | cancel the return dialog | 0x4289a0 | `A(11, [08])` |
@@ -1031,15 +1062,13 @@ Independently, leaving slot 11 (`old == 11`) hides the cancel-return dialog.
 * **Stop.** `stop()` sends two writes: first `HALT_ACTIVE`,
   `A(0, [00..09, 0F×6 (slots 10–15), 13×4 (slots 16–19), 07×12])`, which redirects a
   running drive, hold, next drive or return into its bank's DriveNowhere stage (15 or
-  19), then the console's `STOP_ACTIVE` to go from there to 7. The console sends only
-  the second; on an LF Plus that alone left the crosshead running (§11.1). The
-  colleague's working stop on the OLE route was equivalent: start a new stage whose
-  limit is the present position. A segment ended by `stop()` finishes with reason
-  `"stopped"` even if it entered `b+3` by reaching its limit in the same instant.
-  **Untested on hardware**, like everything else here; it is the first thing to try.
-  If the second write turns out not to move the machine from DriveNowhere to 7
-  either, the fallback is a redirect into a stage whose `next` chain ends in 7, such
-  as `N(4, [07])` then `A(b+3, [04])` (re-arm grip protection, then ready).
+  19), then the console's `STOP_ACTIVE` to go from there to 7. Verified on an LF Plus:
+  the machine reports `16 → 19 → 7` within a millisecond and the head halts about
+  0.1 mm on at 10 mm/min. The console's single write also works (§11.1); the extra
+  write was added when issue #1 suggested otherwise, and is kept because it stops
+  through a stage built for the purpose and costs one report. A segment ended by
+  `stop()` finishes with reason `"stopped"` even if it entered `b+3` by reaching its
+  limit in the same instant.
 * **Stop before Zero/ReturnToZero.** If a segment is running or finished in a bank,
   Zero and ReturnToZero issue Stop first. The console requires the script to do it.
 * **Release on close.** `LloydPlus.close()` stops and releases control if the PC holds
@@ -1101,21 +1130,23 @@ Stage subsystem (§11):
 
 | question | how to settle |
 |---|---|
-| Does the LF Plus speak this protocol? | **Answered** (issue #1): it connects to `LrCon.exe`. Still wanted: a `lloydplus sniff` / `info` run to see the wire. |
+| Does the LF Plus speak this protocol? | **Answered:** yes, verified with this library (§0). |
 | Does the machine gate its TX on CTS? | **Answered** (issue #1): yes. |
-| Does `stop()` halt a drive? (§11.9) | Free air, 30 mm move at 10 mm/min, `stop()` half way; the head should halt within a fraction of a mm and the machine report `b → b+3 → 7`. Then the same during a hold and during ReturnToZero. If it stops in `b+3` and never reaches 7, try the fallback in §11.9. |
-| Does a redirect into slot 7 ever stop motion? | Send `STOP_ACTIVE` alone during a drive and watch for a `b → 7` report. Tells apart "redirect ignored" from "followed but motor left running" (§11.1). |
-| Units: confirm N and mm on the wire (§10) | Known weight on the load cell; measured crosshead travel, read through `lloydplus log`. The console's display already agrees (issue #1). |
-| Machine-side boot behaviour | First seconds of a capture. |
+| Does `stop()` halt a drive? (§11.9) | **Answered:** yes, `16 → 19 → 7`, halt within ~0.1 mm at 10 mm/min. |
+| Does a redirect into slot 7 stop motion? | **Answered:** yes, `16 → 7` in 0.23 s at 60 mm/min, head stationary after. |
+| Units (§10) | **Answered** for mm and mm/s (commanded travel and time agree with the readings). N: consistent with a known foam compression; a calibrated weight would make it exact. |
+| Machine-side boot behaviour | **Answered:** BOOT state 0 flooded at line rate while idle; `Growing` / `Maturing` trace frames as the link comes up (§4.1). |
 | `DataInformation` `extra` and the a/b fields | Read real records with `lloydplus -v info`. |
 | `KeypadEZ` codes | Unknown; not needed. |
 | Exact machine-side timing | A capture of a real NEXYGEN session through a passive RS-232 tap, decoded with `lloydplus sniff --file`, would confirm the whole of §2–§11 at once. |
-| `active` table semantics, and the take-control race (§11.5 step 5) | Capture a take-control. Check that `01 01 03 00` arrives after the machine has already left slot 3. |
+| The take-control race (§11.5 step 5) | Worked three times out of three (`1 → 3 → 4 → 5 → 7`, all reports within 1 ms). Still worth a look at the wire timing of `01 01 03 00` relative to the `3 → 4` report. |
 | What WaitExclusive / WaitShared wait for (§11.4) | Watch transition reports while using the frame's own keypad (start a local test, open a menu); Plus frames have no Local/Remote switch. |
-| What an empty slot (0, 7) does | Transition reports after connect: the machine should sit in 7 once control is taken. |
+| What an empty slot does | **Answered** for 7: the machine sits there, motor stopped, until redirected. Slot 0 (failed gain) not yet seen. |
 | Does a rate-0 hold ever complete by itself? (§11.7) | Run a stage with HoldTime and watch for a `b+1 →` report. |
-| Does the machine accept two-digit exponents? | Send `5.0e+01` instead of `5.000000e+001` and compare. Until then, emit MSVC's form. |
+| Does the machine accept two-digit exponents? | Send `5.0e+01` instead of `5.000000e+001` and compare. Until then, emit MSVC's form (verified accepted). |
 | True-strain-rate units (§11.3) | Unresolved statically; a NEXYGEN capture of a strain-controlled test. |
+| The self-test menu (§1) | Answered `test` for the colleague on a fresh machine; did not answer for us after a PC session, with RTS high or low. Try `lloydplus diag` first thing after power-on. |
+| Load limits, holds, Next, ReturnToZero, Zero | Not yet run on hardware. Free air, low speed, in that order; `home` only after a `zero` at a known position. |
 
 ## 14. Reproducing the analysis
 

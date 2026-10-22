@@ -4,13 +4,13 @@ It implements the machine side as understood from the PC console's code, so
 it validates this library's self-consistency, not the real firmware.  Its
 link layer is the same symmetric :class:`~lloydplus.link.Link`.
 
-The stage engine follows the model in PROTOCOL.md §11: ``next`` is followed
-when a stage completes, ``active`` is applied when it is written, except that
-a running motion stage ignores a redirect into an empty slot (the hardware
-observation behind §11.9 "Stop").  The mechanics are a crosshead at
-``position`` mm pulling a linear sample of ``stiffness`` N/mm
-(load = stiffness * position): tension positive, compression negative, as
-measured on an LF Plus.
+The stage engine follows the model in PROTOCOL.md §11 as confirmed on an LF
+Plus: ``next`` is followed when a stage completes; an ``active`` write that
+covers the current slot makes the machine enter ``active[current]`` at once,
+even when that is the same slot (a ``19 -> 19`` re-entry report).  The
+mechanics are a crosshead at ``position`` mm pulling a linear sample of
+``stiffness`` N/mm (load = stiffness * position): tension positive,
+compression negative, as measured.
 """
 
 from __future__ import annotations
@@ -232,16 +232,10 @@ class SimMachine:
         count, start, values = p[1], p[2], p[3:]
         table = self.active if p[0] == 1 else self.next
         table[start:start + count] = list(values)
-        # a redirect is checked only for the slots this packet wrote (PROTOCOL.md §11.1)
-        if (p[0] == 1 and start <= self.current < start + count
-                and self.active[self.current] != self.current):
-            target = self.active[self.current]
-            kind = self.stages.get(self.current, (None, b""))[0]
-            if kind in _MOTION and target not in self.stages:
-                # observed on hardware: the console's Stop (drive -> empty slot 7)
-                # left the crosshead running; a redirect into a stage pre-empts
-                return
-            self._goto(target)
+        # a redirect is checked only for the slots this packet wrote, and is
+        # followed even when active[current] == current (PROTOCOL.md §11.1)
+        if p[0] == 1 and start <= self.current < start + count:
+            self._goto(self.active[self.current])
 
     # -- services ---------------------------------------------------------
 

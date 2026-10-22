@@ -57,7 +57,7 @@ class LloydPlus:
 
     def __init__(self, port: str | Port, *, rtscts: bool = True, dtr: bool = False,
                  on_message: Callable[[svc.MachineMessage], None] | None = None,
-                 watchdog_interval: float = 10.0, extension_source: int = 1) -> None:
+                 watchdog_interval: float = 2.0, extension_source: int = 1) -> None:
         self._own_port = isinstance(port, str)
         self.port = open_serial(port, rtscts=rtscts, dtr=dtr) if isinstance(port, str) else port
         self.watchdog_interval = watchdog_interval

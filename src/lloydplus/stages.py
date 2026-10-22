@@ -4,11 +4,10 @@ The machine runs "stages" out of a 32-slot arena.  Each stage kind has its own
 factory service; the PC creates a stage by sending ``[slot, params...]`` to it.
 ``StageArenaReference5`` holds two tables: ``next[i]`` (where to go when the
 stage in slot i completes) and ``active[i]`` (a redirect out of slot i,
-applied when written).  The machine reports every slot change.  On hardware,
-a redirect out of a running drive into the empty slot 7 (the console's Stop)
-did not halt the crosshead, while a redirect into another motion stage did
-(PROTOCOL.md §11.1); :meth:`StageControl.stop` therefore redirects into the
-bank's DriveNowhere stage first.
+applied when written, even when ``active[i] == i``, which re-enters slot i).
+The machine reports every slot change.  Verified on an LF Plus (firmware
+3.0.94) on 2026-10-22: connect, take and release control, drive segments,
+stop and the transition reports all behaved as described here.
 
 :class:`StageControl` reproduces the slot layout and command sequences of the
 NEXYGEN 4.1 console (``CMachineStageWrapper``, 0x4256f0..0x4289d0).
@@ -88,9 +87,9 @@ CONNECT_NEXT = bytes((0, 2, 1, 4, 5, 6, 7, 7, 1, 7, 7, 8))           # 0x426573
 RELEASE_ACTIVE = bytes((0, 1, 2, 1) + (8,) * 6 + (11, 11) + (8,) * 19 + (7,))  # 0x426b20
 STOP_ACTIVE = bytes(range(10)) + bytes((7, 8)) + bytes((7,)) * 20    # 0x427580
 # lloydplus addition (PROTOCOL.md §11.9): every motion slot -> its bank's
-# DriveNowhere stage (15 or 19), which stops the crosshead where it is.  Sent
-# before STOP_ACTIVE, whose redirect into the empty slot 7 did not halt a
-# running drive on hardware.
+# DriveNowhere stage (15 or 19).  Sent before STOP_ACTIVE.  Both writes stop
+# a drive on hardware (16 -> 19 -> 7, or 16 -> 7 for STOP_ACTIVE alone); this
+# one goes through a stage whose job is to stop, so it is kept first.
 HALT_ACTIVE = (bytes(range(10)) + bytes((SLOT_STOP_A,)) * 6
                + bytes((SLOT_STOP_B,)) * 4 + bytes((7,)) * 12)
 _SEGMENT_ACTIVE = (bytes(range(7)) + b"\xff\x08\x09\xff\xff" + b"\xff" * 8
@@ -374,7 +373,7 @@ class StageControl:
       ``active[0] = 2`` so the machine returns to the wait loop;
     * :meth:`stop` first redirects any running drive into the bank's
       DriveNowhere stage (``HALT_ACTIVE``), then sends the console's own Stop
-      write.  The console's write alone did not stop a drive on hardware.
+      write.  Either alone stops the machine; both are verified on hardware.
     * TrueStrainRate stages are not offered: the rate's unit is unresolved.
 
     See PROTOCOL.md §11.9 for the full list.
@@ -557,11 +556,11 @@ class StageControl:
         """Halt the crosshead and go to ready (slot 7).
 
         Two arena writes.  ``HALT_ACTIVE`` redirects a running drive, hold,
-        next drive or return into its bank's DriveNowhere stage (``b+3``),
-        which stops the crosshead where it is.  Then the console's own Stop
-        (0x427580, ``STOP_ACTIVE``) takes the machine from there to ready.
-        The console sends only the second write; on hardware that alone did
-        not halt a running drive (PROTOCOL.md §11.9).
+        next drive or return into its bank's DriveNowhere stage (``b+3``);
+        then the console's own Stop (0x427580, ``STOP_ACTIVE``) takes the
+        machine from there to ready.  Verified on an LF Plus: the machine
+        reports ``b -> b+3 -> 7`` within a millisecond of each other and the
+        head halts within ~0.1 mm at 10 mm/min (PROTOCOL.md §11.9).
 
         A segment ended this way finishes with reason ``"stopped"``.
         """

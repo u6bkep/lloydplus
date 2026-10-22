@@ -320,19 +320,32 @@ def test_stop_right_after_start_waits_for_it(pair):
     assert m.control.ready and seg.wait(1) and seg.reason == "stopped"
 
 
-# -- stop: what the hardware taught us (issue #1) ---------------------------
+# -- stop, as verified on an LF Plus (2026-10-22) ----------------------------
 
-def test_console_stop_write_alone_does_not_halt(pair):
-    """The simulator encodes the observation: the console's Stop (a redirect
-    from a running drive into the empty slot 7) leaves the crosshead moving."""
+def test_console_stop_write_alone_halts(pair):
+    """The console's Stop (drive -> empty slot 7) does stop the machine: on
+    hardware it reported 16 -> 7 within 0.23 s and the head stayed put."""
     m, sim = pair
     take(m)
     seg = m.control.start(Drive.to_extension(30.0, 20.0))
     assert seg.started.wait(2)
+    assert wait_until(lambda: sim.position > 0.5)
     m.control.arena.change_active(0, st.STOP_ACTIVE)
-    assert wait_until(lambda: sim.position > 5.0)
-    assert sim.current == seg.base                      # still driving
-    assert seg.wait(5) and seg.reason == "limit reached" and sim.position == pytest.approx(30.0)
+    assert seg.wait(1) and seg.reason == "stopped"
+    where = sim.position
+    time.sleep(0.1)
+    assert sim.current == 7 and sim.position == where and where < 5.0
+
+
+def test_identity_write_re_enters_slot(pair):
+    """Seen on hardware: HALT_ACTIVE sent while in 19 reports 19 -> 19, and
+    STOP_ACTIVE sent while in 7 reports 7 -> 7."""
+    m, sim = pair
+    take(m)
+    n = len(sim.transitions)
+    m.control.arena.change_active(0, st.STOP_ACTIVE)
+    assert wait_until(lambda: len(sim.transitions) > n)
+    assert sim.transitions[n] == (7, 7) and m.control.ready
 
 
 def test_stop_halts_running_drive(pair):

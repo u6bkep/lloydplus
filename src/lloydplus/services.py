@@ -367,7 +367,7 @@ class Watchdog:
     next tick (CMachineWatchdog 0x429e00/0x429f00, 10 s)."""
 
     def __init__(self, mux: ChannelMux, responder: ServiceClient,
-                 on_timeout: Callable[[], None], interval: float = 10.0) -> None:
+                 on_timeout: Callable[[], None], interval: float = 2.0) -> None:
         self.mux = mux
         self.responder = responder
         self.on_timeout = on_timeout
