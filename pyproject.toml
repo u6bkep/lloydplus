@@ -1,0 +1,16 @@
+[project]
+name = "lloydplus"
+version = "0.1.0"
+description = "Driver for the RS-232 PC link of Lloyd Instruments 'Plus' series test frames (LF Plus, LRX Plus, LR Plus, EZ)"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+lloydplus = "lloydplus.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8"]
