@@ -117,6 +117,9 @@ class SimMachine:
         self.factory_packets: list[tuple[str, bytes]] = []
         self.arena_packets: list[bytes] = []
         self.grip_limits: tuple[float, float] | None = None
+        self.tripped = False                    # grip protection has halted the motor
+        self.grip_margin = 10.0                 # N past the limit before it trips (1 % of 1 kN)
+        self._error_ch: int | None = None
         self._channels: list[int] = []
         self._rezero: set[int] = set()
         self._install()
@@ -163,6 +166,7 @@ class SimMachine:
     # -- stage engine -------------------------------------------------------
 
     def _goto(self, slot: int) -> None:
+        self.tripped = False
         for _ in range(64):              # instant stages chain through `next`
             old, self.current = self.current, slot
             self.transitions.append((old, slot))
@@ -179,7 +183,7 @@ class SimMachine:
         if kind in _INSTANT:
             if kind == st.GRIP_PROTECTION:
                 t, c = p.split(b"\0")[:2]
-                self.grip_limits = (atof(t), atof(c))
+                self.grip_limits = (atof(t), abs(atof(c)))     # sent as "T" and "-C"
             return True
         if kind == st.ZERO_READINGS:
             for i, m in enumerate(p):
@@ -215,6 +219,21 @@ class SimMachine:
 
     def _step(self, dt: float) -> None:
         kind, p = self.stages.get(self.current, (None, b""))
+        if kind in _MOTION and self.tripped:
+            return                        # halted by grip protection, still in the slot
+        if kind in _MOTION and self.grip_limits and parse_motion(p)[1] != 0:
+            # as measured: extension-driven moves only, ~1 % of range past the limit,
+            # motor stops, no transition, warning 10 on the PC's Error service.  A
+            # move away from the overload (the retreat) is let through.
+            t, c = self.grip_limits
+            _rate, src, limit, _s, _g = parse_motion(p)
+            going_up = limit > self.reading(src)
+            if ((going_up and self.load > t + self.grip_margin)
+                    or (not going_up and self.load < -(c + self.grip_margin))):
+                self.tripped = True
+                threading.Thread(target=self.push_warning,
+                                 args=(10, "Load has exceeded safety limit."), daemon=True).start()
+                return
         if kind in _MOTION and self._motion_done(p, dt):
             self._goto(self.next[self.current])
         elif kind == st.WAIT_EXCLUSIVE and self.remote:
@@ -336,6 +355,13 @@ class SimMachine:
             raise RuntimeError("PC has not subscribed to StatusInformation")
         self.mux.send(self.status_channel, bytes(((code >> 8) & 0xFF, code & 0xFF)) + text.encode())
         self.mux.send(self.status_channel, b"")
+
+    def push_warning(self, code: int, text: str = "") -> None:
+        """Send ``[2, code_hi, code_lo, text]`` on the PC's "Error" service, as the
+        LF Plus does for the grip-protection trip."""
+        if self._error_ch is None:
+            self._error_ch = self.mux.open_service("Error", timeout=5.0)
+        self.mux.send(self._error_ch, bytes((2, (code >> 8) & 0xFF, code & 0xFF)) + text.encode())
 
     def set_remote(self, remote: bool) -> None:
         """Flip the frame between Local and Remote Control."""

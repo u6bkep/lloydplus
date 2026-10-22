@@ -254,6 +254,9 @@ def cmd_home(args) -> int:
         print("returning to 0 mm at maximum speed (Ctrl+C stops)", file=sys.stderr)
         try:
             m.control.return_to_zero(wait=False)
+            # the machine reports leaving 7 a moment later; don't mistake the
+            # old 7 for "already back"
+            m.control.arena.wait_slot(lambda s: s != 7, 2.0)
             while m.control.slot != 7:
                 print(_readings(m), flush=True)
                 time.sleep(0.5)

@@ -112,7 +112,7 @@ def test_take_and_release_control(pair):
     m, sim = pair
     take(m)
     assert m.control.ready and m.control.in_control
-    assert sim.grip_limits == (900.0, -800.0)
+    assert sim.grip_limits == (900.0, 800.0)
     m.control.release_control()
     assert m.control.slot == st.SLOT_WAIT_SHARED and not m.control.in_control
 
@@ -292,7 +292,7 @@ def test_take_control_again_from_finished_segment(pair):
     assert m.control.ready and sim.position == pytest.approx(1.0)
     assert all(new not in (12, 16) for _, new in sim.transitions[n:])   # no re-run
     m.control.take_control(tensile_limit=100, compressive_limit=100)    # new limits
-    assert m.control.ready and sim.grip_limits == (100.0, -100.0)
+    assert m.control.ready and sim.grip_limits == (100.0, 100.0)
 
 
 def test_take_release_take(pair):
@@ -383,3 +383,21 @@ def test_stop_during_return(pair):
     assert wait_until(lambda: sim.current == st.SLOT_RETURN and sim.position < 19.0)
     m.control.stop()
     assert m.control.ready and 0.0 < sim.position < 19.0
+
+
+def test_grip_protection_trip_ends_segment_and_recovers(pair):
+    """As on the LF Plus: an extension-driven move past the grip limit halts
+    with no transition and a warning 10; the library ends the segment, stops,
+    and the next drive runs.  A load-limited drive is not guarded."""
+    m, sim = pair
+    m.control.take_control(tensile_limit=900, compressive_limit=5)
+    seg = m.control.drive(Drive.to_extension(-30.0, 20.0), timeout=5)
+    assert seg.reason == "load safety limit"
+    assert m.control.safety_trips == 1
+    assert wait_until(lambda: m.control.ready)
+    assert sim.position == pytest.approx(-1.5, abs=0.3)          # (5 + 10 N margin) / 10 N/mm
+    assert any(msg.code == 10 and msg.source == "warning" for msg in m.messages)
+    back = m.control.drive(Drive.to_extension(0.0, 20.0), timeout=5)
+    assert back.reason == "limit reached"
+    deep = m.control.drive(Drive.to_load(-80.0, 20.0), timeout=5)
+    assert deep.reason == "limit reached" and sim.position == pytest.approx(-8.0, abs=0.1)

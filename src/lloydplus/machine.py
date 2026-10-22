@@ -100,6 +100,12 @@ class LloydPlus:
             self.control.on_lost()
 
     def _on_message(self, msg: svc.MachineMessage) -> None:
+        c = self.control
+        if c is not None:
+            try:
+                c.on_machine_message(msg)
+            except Exception:
+                log.exception("stage control could not handle machine message %s", msg)
         self.messages.append(msg)
         for cb in list(self._message_cbs):
             try:

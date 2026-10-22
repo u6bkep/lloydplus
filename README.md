@@ -9,9 +9,10 @@ Status: built from static analysis, then run against an LF Plus (firmware 3.0.94
 1 kN cell) on 2026-10-22. Verified on that machine, unchanged from the static
 analysis: the lead and CTS behaviour, the boot handshake and reliable transport, all
 service opens, machine information, readings at ~1 kHz per source, taking and
-releasing control, crosshead-rate segments, stop (both this library's sequence and the
-console's own write), and the transition reports. Not yet exercised on hardware: load
-limits, holds, next-drive chaining, return-to-zero, zero, the load-rate option.
+releasing control, crosshead-rate and load-rate segments, load limits, holds, next-drive
+chaining, stop (both this library's sequence and the console's own write), zero,
+return-to-zero, grip protection, and the transition reports. Not yet exercised:
+true-strain-rate stages and the frame's local/remote handover.
 
 ## Wiring
 
@@ -115,11 +116,16 @@ uv run lloydplus home --port /dev/ttyUSB0                             # back to 
 
 Each command takes control, does its job, then stops and hands control back. Ctrl+C
 during a move stops the crosshead (verified), and a repeated Ctrl+C keeps stopping
-rather than aborting. Grip protection defaults to
-10 % of the frame's load range; set it with `--tensile-limit` / `--compressive-limit`
-(both positive, N). On a thin or stiff specimen the approach speed, not the load
-limit, is what protects it: at 10 mm/min a 2 N touch-off was detected at 2.2 N, at
-60 mm/min the same threshold overshot to 104 N.
+rather than aborting. Grip protection defaults to 10 % of the frame's load range; set
+it with `--tensile-limit` / `--compressive-limit` (both positive, N). What it does, as
+measured: it guards **extension-driven** moves only (a `--load` move runs to its own
+target regardless), it trips about 1 % of the load range past the limit (a 3 N limit
+tripped at 10.8 N, 20 N at 27 N on a 1 kN cell), the frame beeps "grip over load" and
+the machine reports "Load has exceeded safety limit". The library then ends the move
+with reason `load safety limit` and stops; the next move can start at once, and no key
+press at the frame is needed. On a thin or stiff specimen the approach speed, not the
+load limit, is what protects it: at 10 mm/min a 2 N touch-off was detected at 2.2 N,
+at 60 mm/min the same threshold overshot to 104 N.
 
 From Python (units: mm, N, mm/s, N/s, s):
 

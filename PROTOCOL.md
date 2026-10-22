@@ -29,10 +29,18 @@ change to the protocol code:
 * a write that covers the current slot re-enters it even when `active[i] == i`
   (`19 → 19`, `7 → 7` reports) (§11.1);
 * the firmware's RAW frames carry trace text (§4), an idle machine floods BOOT frames
-  at line rate (§4.1), and it drops a silent PC after about 4 s (§8.2).
+  at line rate (§4.1), and it drops a silent PC after about 4 s (§8.2);
+* holds (`16 → 17`, position held, `17 → 19` on the PC's expiry write), Next
+  (`16 → 17 → 18 → 19`, back within 0.01 mm), a load-limited drive (direction inferred
+  from the sign, stopped at −5.38 N for −5 N at 10 mm/min), a load hold through the
+  LoadRate factory (`12 → 13`, re-regulated a relaxing foam back to −5.0 N), Zero
+  (`7 → 9 → 7`, reading to 0.000), ReturnToZero (`7 → 10 → 7`, 5 mm in 1.1 s, rest at
+  0.006 mm) (§11);
+* grip protection: trips only on extension-driven moves, about 1 % of the load range
+  past the set limit, reported as warning 10 on the PC's Error service with no stage
+  transition; `stop()` then a new drive recovers, nothing at the frame (§11.3).
 
-Not yet exercised on hardware: load limits, holds, Next, ReturnToZero, Zero, the
-LoadRate option, grip protection actually latching, the behaviour of slots 0 and 11.
+Not yet exercised on hardware: TrueStrainRate, slots 0 and 11, the `KeypadEZ` codes.
 
 Earlier the same day a colleague had driven the same machine through NEXYGEN's own
 console, `LrCon.exe`, via its OLE interface (GitHub issue #1 on this repository), which
@@ -63,7 +71,7 @@ Confidence by area:
 | Transport (§2–§6) | Verified on hardware. |
 | Services and readings (§7–§9) | Verified on hardware for everything the library uses. Medium for the meaning of some `DataInformation` fields. |
 | Units (§10) | Verified: mm and mm/s (a commanded 5.4 mm at 10 mm/min took 32.5 s and the extension reading moved 5.4 mm); N by the sign and magnitude of the readings against a known foam compression. |
-| Test control / stages (§11) | Verified on hardware: connect-time setup, take and release control, crosshead-rate segments, stop, transition reports. Inferred and still untested: holds, Next, load limits, ReturnToZero, Zero, slots 0 and 11. |
+| Test control / stages (§11) | Verified on hardware: connect-time setup, take and release control, crosshead-rate and load-rate segments, load limits, holds, Next, stop, Zero, ReturnToZero, grip protection, transition reports. Untested: TrueStrainRate, slots 0 and 11. |
 
 ### Source binary
 
@@ -803,7 +811,7 @@ machine also accepts two-digit exponents is unknown; to be safe, emit MSVC's for
 | `ReleaseExclusiveStageFactory` | `[slot]` | | slot 8 |
 | `DriveNowhereStageFactory` | `[slot]` | | slots 15 and 19 (stop and stay put) |
 | `ZeroReadingsStageFactory` | `[slot, m0, m1, .. mK]` | | slot 9. `m_i = 0xFF` zeroes data source i, `0x00` leaves it; the list ends at the highest source to zero (0x426020) |
-| `GripProtectionStageFactory` | `[slot] "T" 00 "-" "C" 00` | N | slot 4. T = tensile load limit, C = compressive load limit, both from the machine-setup scheme. The `-` is literal in the format string `%c%e%c-%e%c` (0x426bd0) |
+| `GripProtectionStageFactory` | `[slot] "T" 00 "-" "C" 00` | N | slot 4. T = tensile load limit, C = compressive load limit, both from the machine-setup scheme. The `-` is literal in the format string `%c%e%c-%e%c` (0x426bd0) **Verified:** guards extension-driven moves only (a load-limited drive to −10 N ran through a 3 N limit untouched). It trips about 1 % of the load range beyond the limit (3 N → −10.8 N, 20 N → −27 N, 100 N → 107 N on a 1 kN cell), stops the crosshead itself, leaves the machine in the drive slot with no transition report, sends warning 10 "Load has exceeded safety limit." on the PC's `Error` service, and the frame beeps "grip over load, press enter". Stop then a new drive recovers from the PC; no key press needed. |
 | `SetAutoSampleStiffnessStageFactory` | `[slot]` | | slot 5 |
 | `SetManualSampleStiffnessStageFactory` | `[slot] "k" 00` | N/mm | slot 5 (0x426d00) |
 | `SetDatasourceRangeStageFactory` | `[slot, src] "r" 00` | mm | slot 6: set the range of extension source `src` (format `%c%c%e%c`) |
@@ -1020,8 +1028,10 @@ machine → notify      00 10 13            (16 → 19: limit reached, DriveNowh
 * **Hold time.** Entering `b+1` starts a PC timer (0x408b70, timer id 0x65) for the hold
   time. When it fires (0x427520 → 0x4274f0), the console marks the stage finished and
   detaches the readings from it. **Nothing is sent**: the machine stays in the hold
-  stage, still holding, until the client starts another segment or calls Stop. So the
-  console relies on a rate-0 hold never completing by itself **(inferred)**.
+  stage, still holding, until the client starts another segment or calls Stop. Verified:
+  a rate-0 stage does not complete by itself (position and load holds both sat in `b+1`
+  until redirected), and a load hold actively re-regulates (the LF Plus moved 0.02 mm to
+  bring a relaxing foam back to the held −5 N).
 * **Finished.** A `DriveStage` reads as finished when the machine enters 7, 8, `b+2`
   or `b+3` (§11.8).
 * **Break detection.** `NewGradientBreakDetectorStage` (fast break) and
@@ -1069,6 +1079,10 @@ Independently, leaving slot 11 (`old == 11`) hides the cancel-return dialog.
   through a stage built for the purpose and costs one report. A segment ended by
   `stop()` finishes with reason `"stopped"` even if it entered `b+3` by reaching its
   limit in the same instant.
+* **Grip-protection trip.** On warning 10 (§11.3) `StageControl` ends the running and
+  pending segments with reason `"load safety limit"` and issues the stop writes, so
+  `drive()` returns instead of waiting forever in the drive slot. The console leaves
+  the stage object waiting.
 * **Stop before Zero/ReturnToZero.** If a segment is running or finished in a bank,
   Zero and ReturnToZero issue Stop first. The console requires the script to do it.
 * **Release on close.** `LloydPlus.close()` stops and releases control if the PC holds
@@ -1140,13 +1154,13 @@ Stage subsystem (§11):
 | `KeypadEZ` codes | Unknown; not needed. |
 | Exact machine-side timing | A capture of a real NEXYGEN session through a passive RS-232 tap, decoded with `lloydplus sniff --file`, would confirm the whole of §2–§11 at once. |
 | The take-control race (§11.5 step 5) | Worked three times out of three (`1 → 3 → 4 → 5 → 7`, all reports within 1 ms). Still worth a look at the wire timing of `01 01 03 00` relative to the `3 → 4` report. |
-| What WaitExclusive / WaitShared wait for (§11.4) | Watch transition reports while using the frame's own keypad (start a local test, open a menu); Plus frames have no Local/Remote switch. |
+| What WaitExclusive / WaitShared wait for (§11.4) | Still open. Three take-controls in a row went straight through; nothing was done at the frame during them. |
 | What an empty slot does | **Answered** for 7: the machine sits there, motor stopped, until redirected. Slot 0 (failed gain) not yet seen. |
-| Does a rate-0 hold ever complete by itself? (§11.7) | Run a stage with HoldTime and watch for a `b+1 →` report. |
+| Does a rate-0 hold ever complete by itself? (§11.7) | **Answered:** no; both position and load holds waited for the PC's write. |
 | Does the machine accept two-digit exponents? | Send `5.0e+01` instead of `5.000000e+001` and compare. Until then, emit MSVC's form (verified accepted). |
 | True-strain-rate units (§11.3) | Unresolved statically; a NEXYGEN capture of a strain-controlled test. |
 | The self-test menu (§1) | Answered `test` for the colleague on a fresh machine; did not answer for us after a PC session, with RTS high or low. Try `lloydplus diag` first thing after power-on. |
-| Load limits, holds, Next, ReturnToZero, Zero | Not yet run on hardware. Free air, low speed, in that order; `home` only after a `zero` at a known position. |
+| Grip protection on load-limited drives | **Answered:** it does not apply to them (§11.3); only the drive's own limit stops a load-limited stage, so give it a sane target. |
 
 ## 14. Reproducing the analysis
 

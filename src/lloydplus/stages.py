@@ -51,6 +51,11 @@ BANKS = (16, 12)              # segment bases, in the order the console uses the
 
 NO_SOURCE = 0xFF
 
+# Machine warning "Load has exceeded safety limit." (services.MESSAGE_TEXT): the
+# grip-protection trip.  Verified on an LF Plus: the machine halts the
+# crosshead, stays in the drive slot, and sends this on the PC's Error service.
+SAFETY_LIMIT_CODE = 10
+
 # Factory service names
 DO_NOTHING = "DoNothingStageFactory"
 WAIT_SHARED = "WaitSharedStageFactory"
@@ -394,6 +399,7 @@ class StageControl:
         self._pending: deque[Segment] = deque()   # started, not yet entered (cf. +0x1a4)
         self._running: Segment | None = None
         self._halting = False              # a stop() is in flight: b+3 means "stopped"
+        self.safety_trips = 0              # grip-protection trips seen (code 10)
         self.take_attempted = False
         self._taken_with: tuple | None = None
         self.arena = StageArena(mux, timeout)
@@ -441,6 +447,27 @@ class StageControl:
         self.factories.clear()
         self.arena.close()
         self._finish_all("closed")
+
+    def on_machine_message(self, msg) -> None:
+        """Called by :class:`LloydPlus` for every machine message.
+
+        Code 10, "Load has exceeded safety limit", is the grip-protection
+        trip.  Verified on an LF Plus: the machine stops the crosshead itself
+        about 1 % of the load range past the limit, stays in the drive slot
+        and reports no transition, so the segment would otherwise never
+        finish.  This ends the running and pending segments with reason
+        ``"load safety limit"`` and sends the stop writes (the machine then
+        reports ``b -> b+3 -> 7``); a new segment can be started straight
+        after, no action at the frame is needed.
+        """
+        if getattr(msg, "code", None) != SAFETY_LIMIT_CODE:
+            return
+        with self._lock:
+            self.safety_trips += 1
+        log.warning("grip protection tripped (slot %d): segments ended", self.slot)
+        self._finish_all("load safety limit")
+        if self.slot >= BANKS[1] or self.slot in (SLOT_RETURN, SLOT_RETURN_RELEASE):
+            self.stop(timeout=None)     # on the reader thread: must not wait
 
     def on_lost(self) -> None:
         """The link or the machine went away: wake all waiters, end all segments."""
