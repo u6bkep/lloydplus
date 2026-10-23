@@ -487,6 +487,8 @@ pub struct Sample {
     pub raw: i64,
     /// `raw * scale`: N for load, mm for extension.
     pub value: f64,
+    /// Units per count, as the stream declared it.
+    pub scale: f64,
 }
 
 impl Sample {
@@ -564,6 +566,7 @@ impl SourceDecoder {
                             ticks: s.ticks,
                             raw: s.accum,
                             value: s.accum as f64 * s.scale,
+                            scale: s.scale,
                         });
                     }
                 }

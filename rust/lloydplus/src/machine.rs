@@ -142,6 +142,9 @@ pub struct LloydPlus {
     pub messages: MessageQueue,
     samples: Channel<CS, Sample, 1024>,
     sample_drops: AtomicU32,
+    /// An extra consumer of every sample (a recorder), called from the
+    /// link's receive context before the sample is queued.
+    tap: Mutex<CS, RefCell<Option<Arc<dyn SampleSink>>>>,
     info: Mutex<CS, RefCell<Info>>,
     session: Slot<Arc<Session>>,
     session_started: Signal<CS, ()>,
@@ -161,6 +164,10 @@ impl SampleSink for Sink {
                 *slot = Some(s);
             }
         });
+        let tap = self.0.tap.lock(|t| t.borrow().clone());
+        if let Some(t) = tap {
+            t.sample(s);
+        }
         if self.0.samples.try_send(s).is_err() {
             self.0.sample_drops.fetch_add(1, Ordering::Relaxed);
         }
@@ -191,6 +198,7 @@ impl LloydPlus {
             messages: MessageQueue::new(),
             samples: Channel::new(),
             sample_drops: AtomicU32::new(0),
+            tap: Mutex::new(RefCell::new(None)),
             info: Mutex::new(RefCell::new(Info::default())),
             session: Mutex::new(RefCell::new(None)),
             session_started: Signal::new(),
@@ -510,6 +518,12 @@ impl LloydPlus {
 
     pub fn sample_drops(&self) -> u32 {
         self.sample_drops.load(Ordering::Relaxed)
+    }
+
+    /// Install (or remove) a sink that sees every sample as it arrives, in
+    /// addition to the queue behind [`LloydPlus::next_sample`].
+    pub fn set_sample_tap(&self, tap: Option<Arc<dyn SampleSink>>) {
+        self.tap.lock(|t| *t.borrow_mut() = tap);
     }
 
     /// Next machine message (status, error or warning).

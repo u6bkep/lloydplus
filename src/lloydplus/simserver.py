@@ -56,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--forever", action="store_true", help="serve connections until killed")
     ap.add_argument("--stiffness", type=float, default=10.0, help="sample stiffness, N/mm")
     ap.add_argument("--local", action="store_true", help="frame not in Remote Control")
+    ap.add_argument("--gap", action="store_true",
+                    help="compression-only specimen with its surface at 0 mm (free air above)")
     ap.add_argument("--sample-period", type=int, default=10, help="ticks between samples")
     args = ap.parse_args(argv)
 
@@ -71,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"client {peer[0]}:{peer[1]}", file=sys.stderr, flush=True)
             port = SocketPort(conn)
             sim = SimMachine(port, stiffness=args.stiffness, remote=not args.local,
-                             sample_period_ticks=args.sample_period)
+                             gap=args.gap, sample_period_ticks=args.sample_period)
             sim.start()
             port.closed.wait()
             sim.stop()

@@ -80,7 +80,7 @@ class SimMachine:
     def __init__(self, port, *, version=(2, 1, 7),
                  descriptions=("LF", "LF Plus", "Lloyd Instruments LF Plus"),
                  sample_period_ticks: int = 10, stiffness: float = 10.0,
-                 remote: bool = True,
+                 remote: bool = True, gap: bool = False,
                  fitted: set[str] | None = None) -> None:
         self.version = bytes(version)
         self.descriptions = descriptions
@@ -102,6 +102,9 @@ class SimMachine:
         self.parameters = ("1000", "1100", "0.000166667", "33.8667")   # N, mm, mm/s, mm/s
         # mechanics
         self.stiffness = stiffness
+        # gap=True: a compression-only specimen whose surface is at position 0;
+        # above it the crosshead is in free air and the load reads 0.
+        self.gap = gap
         self.position = 0.0                     # mm, absolute
         self.zero = {0: 0.0, 1: 0.0}            # readings subtracted after Zero
         self.remote = remote                    # frame set to Remote Control
@@ -140,6 +143,8 @@ class SimMachine:
 
     @property
     def load(self) -> float:
+        if self.gap and self.position > 0:
+            return 0.0
         return self.stiffness * self.position
 
     def reading(self, index: int) -> float:
@@ -210,6 +215,11 @@ class SimMachine:
         here = self.reading(src)
         gap = limit - here
         per_mm = self.stiffness if src == 0 else 1.0
+        if src == 0 and self.gap and self.position > 0 and limit < here:
+            # load-driven move down through free air: nothing changes until
+            # the surface; just travel
+            self.position = max(0.0, self.position - speed * dt)
+            return False
         step = speed * dt * per_mm
         if abs(gap) <= max(step, 1e-9):
             self.position += gap / per_mm
