@@ -385,3 +385,29 @@ fn local_frame_refuses_control() {
         assert!(!c.in_control());
     });
 }
+
+#[test]
+fn zero_sources_zeros_only_the_named_source() {
+    with_machine(&[], opts(), |m| async move {
+        let c = m.control().unwrap();
+        c.take_control(Protection::limits(100.0, 100.0), Duration::from_secs(5))
+            .await
+            .unwrap();
+        // 3 mm into the 10 N/mm sample: 30 N
+        c.drive(Drive::to_extension(3.0, 10.0), None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        settle().await;
+        c.zero_sources(&[1], Duration::from_secs(5)).await.expect("zero extension");
+        settle().await;
+        assert!(m.extension().unwrap().abs() < 0.05, "extension zeroed");
+        assert!((m.load().unwrap() - 30.0).abs() < 1.5, "load untouched: {:?}", m.load());
+        c.zero_sources(&[0], Duration::from_secs(5)).await.expect("zero load");
+        settle().await;
+        assert!(m.load().unwrap().abs() < 0.5, "load zeroed: {:?}", m.load());
+        assert!(m.extension().unwrap().abs() < 0.05, "extension still zero");
+        c.drive(Drive::to_extension(-3.0, 10.0), None, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+    });
+}

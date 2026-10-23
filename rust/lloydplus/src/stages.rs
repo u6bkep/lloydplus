@@ -951,6 +951,8 @@ pub struct StageControl {
     pub min_speed: f64,
     pub max_speed: f64,
     pub extension_source: u8,
+    /// Data source indices the all-sources zero stage covers.
+    sources: Vec<u8>,
     factories: BTreeMap<&'static str, ServiceClient>,
     pub missing: Vec<&'static str>,
     core: Arc<Core>,
@@ -1082,6 +1084,7 @@ impl StageControl {
             min_speed,
             max_speed,
             extension_source,
+            sources: sources.to_vec(),
             factories,
             missing,
             core,
@@ -1412,7 +1415,22 @@ impl StageControl {
     /// `Console.Zero` (0x427570): zero all readings. Stops a segment first;
     /// otherwise only from ready.
     pub async fn zero(&self, timeout: Duration) -> Result<(), StageError> {
+        let all = self.sources.clone();
+        self.zero_sources(&all, timeout).await
+    }
+
+    /// Zero only the given data sources (0 = load, 1 = extension). A
+    /// lloydplus addition: the console always zeros everything, but the
+    /// ZeroReadings stage takes a per-source mask, so a touch-off can zero
+    /// load in air and extension at contact. Re-installs the zero stage for
+    /// the requested sources (the factory is reopened for the write, as the
+    /// console closes it after connect), then runs it as `zero` does.
+    pub async fn zero_sources(&self, sources: &[u8], timeout: Duration) -> Result<(), StageError> {
         self.require_ready("zero").await?;
+        let factory = ServiceClient::open(self.arena.client.mux(), ZERO_READINGS, timeout).await?;
+        let r = factory.send(&zero_readings_stage(SLOT_ZERO, sources)).await;
+        factory.close().await;
+        r?;
         let mark = self.arena.mark();
         self.arena.change_active(SLOT_READY, &[SLOT_ZERO]).await?;
         if self

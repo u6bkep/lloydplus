@@ -177,10 +177,27 @@ cargo run -p lloydplus-host -- move --port /dev/ttyUSB0 --to 10 --speed 50
 cargo test                                                      # unit tests + the simulator tests (needs uv)
 ```
 
-Status: every layer passes the same simulator scenarios as the Python driver (connect,
-information, 1 kHz readings, take and release control, drives, holds, next-drive
-chaining, pre-emption, stop, zero, return to zero, grip-protection trip and recovery).
-Not yet run against the frame; the Python driver remains the hardware-verified reference.
+Status: every layer passes the same simulator scenarios as the Python driver, and on
+2026-10-23 the crate ran against the LF Plus through the FTDI lead: information, 1024
+samples/s per source, free-air drives, stop mid-drive (slot 7 within 0.19 s, 0.23 mm
+overrun at 60 mm/min), position holds, load-limited drives, source-selective zero, a
+mid-move grip trip with recovery, and the touch-off below (PROTOCOL.md §0).
+
+```
+cargo run -p lloydplus-host -- touchoff --port /dev/ttyUSB0 --speed 60 --rough 5 --threshold 2 --slow 5
+```
+
+`touchoff` finds the specimen the way a CNC probe does and takes about 10 s whatever the
+gap: a rough touch at `--speed` that the frame ends at `--rough` N, a back-off until the
+force is gone plus 0.5 mm of clearance, a load zero there in air, a slow touch at `--slow`
+mm/min to `--threshold` N, and an extension zero at that contact. The two zeros are
+separate because `Zero` tares every reading: a zero taken under contact leaves a tare on
+the load (`StageControl::zero_sources` zeros one source at a time). Measured on the foam:
+the 60 mm/min rough touch overshoots the 5 mm/min contact by 0.2–0.3 mm.
+
+Note that the frame's "load hold" (a rate-0 LoadRate stage) holds position, not load: a
+hold entered at −21 N relaxed to −17 N in 3 s with the crosshead still. A constant-force
+hold is a PC-side loop of load-limited drives.
 
 ## Layout
 

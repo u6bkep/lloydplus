@@ -17,6 +17,19 @@ claim is an inference rather than a reading of the code, it says so.
 null-modem lead. Everything it exercised behaved as this document describes, with no
 change to the protocol code:
 
+**Second pass (2026-10-23), with the Rust port** (`rust/lloydplus`, same frame, same
+lead): connect and information, 1024 samples/s per source with none dropped, free-air
+drives (2 mm at 60 mm/min in 2.24 s), Stop mid-drive (slot 7 reported 0.19 s after the
+writes, 0.23 mm overrun at 60 mm/min, no drift after), a 3 s position hold and its PC-timed
+exit, load-limited drives at 10 and 60 mm/min, a source-selective Zero (load alone in air,
+then extension alone at contact), a grip trip mid-move (3 N limit tripped at −12.3 N) with
+recovery by Stop and a new drive, and a probe-style touch-off (rough touch at 60 mm/min,
+back off, 0.5 mm clearance, load zero in air, 5 mm/min touch to 2 N, extension zero) in
+10 s. One correction came out of it: a rate-0 LoadRate stage holds **position**, not load
+(§11.7). Both drivers saw the machine resend every data packet until acked (about 40 %
+of received frames are duplicates at the PC's 100 ms idle-ack cadence); that is the
+frame's transport, not a fault.
+
 * boot handshake, reliable transport and all service opens (§4–§8), including the
   stage factories; `Version` 3.0.94, `TensileParameters` 1000 N / 500 mm /
   0.000833–21.17 mm/s, `DataInformation` records for load and extension;
@@ -33,7 +46,7 @@ change to the protocol code:
 * holds (`16 → 17`, position held, `17 → 19` on the PC's expiry write), Next
   (`16 → 17 → 18 → 19`, back within 0.01 mm), a load-limited drive (direction inferred
   from the sign, stopped at −5.38 N for −5 N at 10 mm/min), a load hold through the
-  LoadRate factory (`12 → 13`, re-regulated a relaxing foam back to −5.0 N), Zero
+  LoadRate factory (`12 → 13`; see §11.7 for what it holds), Zero
   (`7 → 9 → 7`, reading to 0.000), ReturnToZero (`7 → 10 → 7`, 5 mm in 1.1 s, rest at
   0.006 mm) (§11);
 * grip protection: trips only on extension-driven moves, about 1 % of the load range
@@ -1040,8 +1053,11 @@ machine → notify      00 10 13            (16 → 19: limit reached, DriveNowh
   detaches the readings from it. **Nothing is sent**: the machine stays in the hold
   stage, still holding, until the client starts another segment or calls Stop. Verified:
   a rate-0 stage does not complete by itself (position and load holds both sat in `b+1`
-  until redirected), and a load hold actively re-regulates (the LF Plus moved 0.02 mm to
-  bring a relaxing foam back to the held −5 N).
+  until redirected). **A rate-0 LoadRate stage holds position, not load**: measured on
+  2026-10-23 with both drivers, a hold entered at −21.2 N relaxed to −17.4 N over 3 s with
+  the extension frozen at −0.4260 mm (an earlier note that it re-regulated was a 0.02 mm
+  reading within noise). A constant-force hold therefore has to be a PC-side loop of
+  load-limited drives.
 * **Finished.** A `DriveStage` reads as finished when the machine enters 7, 8, `b+2`
   or `b+3` (§11.8).
 * **Break detection.** `NewGradientBreakDetectorStage` (fast break) and
@@ -1166,7 +1182,7 @@ Stage subsystem (§11):
 | The take-control race (§11.5 step 5) | Worked three times out of three (`1 → 3 → 4 → 5 → 7`, all reports within 1 ms). Still worth a look at the wire timing of `01 01 03 00` relative to the `3 → 4` report. |
 | What WaitExclusive / WaitShared wait for (§11.4) | Still open. Three take-controls in a row went straight through; nothing was done at the frame during them. |
 | What an empty slot does | **Answered** for 7: the machine sits there, motor stopped, until redirected. Slot 0 (failed gain) not yet seen. |
-| Does a rate-0 hold ever complete by itself? (§11.7) | **Answered:** no; both position and load holds waited for the PC's write. |
+| Does a rate-0 hold ever complete by itself? (§11.7) | **Answered:** no; both position and load holds waited for the PC's write. A load hold does not re-regulate either. |
 | Does the machine accept two-digit exponents? | Send `5.0e+01` instead of `5.000000e+001` and compare. Until then, emit MSVC's form (verified accepted). |
 | True-strain-rate units (§11.3) | Unresolved statically; a NEXYGEN capture of a strain-controlled test. |
 | The self-test menu (§1) | Answered `test` for the colleague on a fresh machine; did not answer for us after a PC session, with RTS high or low. Try `lloydplus diag` first thing after power-on. |
