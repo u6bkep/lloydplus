@@ -9,6 +9,7 @@ use core::{cell::RefCell, sync::atomic::Ordering};
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
     channel::Channel,
+    signal::Signal,
 };
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 
@@ -138,6 +139,10 @@ impl MachineMessage {
 /// monitor.
 pub struct MessageQueue {
     ch: Channel<CS, MachineMessage, 16>,
+    /// The grip-protection trip (code 10) is latched separately so it can
+    /// never be lost to a full queue: the machine sends no transition for
+    /// it, so a missed one would leave a segment running forever.
+    trip: Signal<CS, MachineMessage>,
 }
 
 impl Default for MessageQueue {
@@ -148,9 +153,26 @@ impl Default for MessageQueue {
 
 impl MessageQueue {
     pub const fn new() -> Self {
-        Self { ch: Channel::new() }
+        Self {
+            ch: Channel::new(),
+            trip: Signal::new(),
+        }
     }
     pub fn push(&self, m: MachineMessage) {
+        if m.code == SAFETY_LIMIT_CODE {
+            self.trip.signal(m);
+            return;
+        }
+        if self.ch.try_send(m).is_err() {
+            warn!("machine message queue full; message dropped");
+        }
+    }
+    /// The next grip-protection trip message.
+    pub async fn wait_trip(&self) -> MachineMessage {
+        self.trip.wait().await
+    }
+    /// Queue for the application: every message, in order, no latching.
+    pub fn push_user(&self, m: MachineMessage) {
         if self.ch.try_send(m).is_err() {
             warn!("machine message queue full; message dropped");
         }
@@ -183,8 +205,10 @@ pub fn install_local_services(mux: &Mux, messages: Arc<MessageQueue>) {
         "Version",
         local_service(|_, _| {
             Some(Arc::new(ReplyHandler(|m: &Mux, p: &[u8]| {
-                if let Some(&ch) = p.first() {
-                    let _ = m.try_send(ch, &PC_VERSION);
+                if let Some(&ch) = p.first()
+                    && m.try_send(ch, &PC_VERSION).is_err()
+                {
+                    warn!("Version reply dropped: link queue full");
                 }
             })))
         }),
@@ -194,8 +218,8 @@ pub fn install_local_services(mux: &Mux, messages: Arc<MessageQueue>) {
         "Description",
         local_service(|_, _| {
             Some(Arc::new(ReplyHandler(|m: &Mux, p: &[u8]| {
-                if p.len() >= 2 {
-                    let _ = m.try_send(p[0], PC_DESCRIPTION.as_bytes());
+                if p.len() >= 2 && m.try_send(p[0], PC_DESCRIPTION.as_bytes()).is_err() {
+                    warn!("Description reply dropped: link queue full");
                 }
             })))
         }),
@@ -205,8 +229,10 @@ pub fn install_local_services(mux: &Mux, messages: Arc<MessageQueue>) {
         "Responder",
         local_service(|_, _| {
             Some(Arc::new(ReplyHandler(|m: &Mux, p: &[u8]| {
-                if let Some((&ch, rest)) = p.split_first() {
-                    let _ = m.try_send(ch, rest);
+                if let Some((&ch, rest)) = p.split_first()
+                    && m.try_send(ch, rest).is_err()
+                {
+                    warn!("Responder reply dropped: link queue full");
                 }
             })))
         }),
@@ -529,7 +555,9 @@ impl SourceDecoder {
             match kind {
                 0 => {
                     for pair in d.chunks_exact(2) {
-                        s.accum += i16::from_be_bytes([pair[0], pair[1]]) as i64;
+                        s.accum = s
+                            .accum
+                            .wrapping_add(i16::from_be_bytes([pair[0], pair[1]]) as i64);
                         s.ticks = s.ticks.wrapping_add(s.increment as u64);
                         out.push(Sample {
                             source: self.index,
@@ -540,7 +568,9 @@ impl SourceDecoder {
                     }
                 }
                 1 if d.len() == 4 => {
-                    s.accum += i32::from_be_bytes([d[0], d[1], d[2], d[3]]) as i64;
+                    s.accum = s
+                        .accum
+                        .wrapping_add(i32::from_be_bytes([d[0], d[1], d[2], d[3]]) as i64);
                 }
                 2 if d.len() == 4 => {
                     s.accum = 0;
@@ -702,16 +732,19 @@ pub async fn watchdog(mux: &'static Mux, responder: &ServiceClient, interval: Du
         error!("watchdog: no channel");
         return;
     };
+    // The console pings after the first interval, not at once.
+    Timer::after(interval).await;
     loop {
         let t0 = Instant::now();
-        if responder.send(&[ch]).await.is_err() {
-            break;
-        }
-        match with_timeout(interval, q.receive()).await {
-            Ok(Some(_)) => {}
-            _ => {
-                error!("watchdog: machine did not answer");
-                break;
+        if let Err(e) = responder.send(&[ch]).await {
+            warn!("watchdog: ping not sent: {}", crate::fmt::Debug2Format(&e));
+        } else {
+            match with_timeout(interval, q.receive()).await {
+                Ok(Some(_)) => {}
+                _ => {
+                    error!("watchdog: machine did not answer");
+                    break;
+                }
             }
         }
         Timer::at(t0 + interval).await;

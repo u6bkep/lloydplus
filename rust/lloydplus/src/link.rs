@@ -128,7 +128,13 @@ pub struct LinkStats {
 /// Receiver of delivered transmission packets (`[channel, bytes...]`).
 pub trait PacketSink: Sync {
     fn on_packet(&self, data: &[u8]);
+    /// The peer restarted the link: every channel above it is gone. Called
+    /// synchronously, before any packet of the new session can arrive.
+    fn on_reset(&self) {}
 }
+
+/// Echo replies waiting for the sender; beyond this they are dropped.
+const MAX_RAW_OUT: usize = 16;
 
 struct Unacked {
     seq: u8,
@@ -137,6 +143,9 @@ struct Unacked {
 }
 
 struct State {
+    /// Counts link sessions; a queued packet from an older session is never
+    /// sent (the Python driver drops its queue under the same lock).
+    session: u32,
     boot_state: u8,
     last_boot_tx: Option<Instant>,
     tx_seq: u8,
@@ -157,6 +166,7 @@ struct State {
 impl State {
     const fn new() -> Self {
         Self {
+            session: 0,
             boot_state: 0,
             last_boot_tx: None,
             tx_seq: 0,
@@ -182,7 +192,9 @@ impl State {
     fn reset(&mut self) {
         let stats = self.stats;
         let trace = self.last_trace.take();
+        let session = self.session.wrapping_add(1);
         *self = Self::new();
+        self.session = session;
         self.stats = stats;
         self.last_trace = trace;
     }
@@ -193,11 +205,15 @@ impl State {
 pub struct Link {
     cfg: LinkConfig,
     state: Mutex<CS, RefCell<State>>,
-    /// Packets accepted by [`Link::send`], not yet given a sequence number.
-    queue: Channel<CS, Vec<u8>, 32>,
+    /// Packets accepted by [`Link::send`], tagged with their session, not
+    /// yet given a sequence number.
+    queue: Channel<CS, (u32, Vec<u8>), 32>,
     tx_wake: Signal<CS, ()>,
     conn_changed: Signal<CS, ()>,
     events: Channel<CS, LinkEvent, 8>,
+    /// Latched on every reset, so a reset is never missed even if `events`
+    /// overflows.
+    reset_sig: Signal<CS, ()>,
 }
 
 impl Default for Link {
@@ -215,6 +231,7 @@ impl Link {
             tx_wake: Signal::new(),
             conn_changed: Signal::new(),
             events: Channel::new(),
+            reset_sig: Signal::new(),
         }
     }
 
@@ -246,21 +263,38 @@ impl Link {
         }
     }
 
-    /// Next link event (connected / reset). Events queue (8 deep).
+    /// Next link event (connected / reset). Events queue (8 deep); a reset
+    /// is also latched for [`Link::wait_reset`].
     pub async fn next_event(&self) -> LinkEvent {
         self.events.receive().await
     }
 
+    /// Wait for the next link reset (loss-free, unlike the event queue).
+    pub async fn wait_reset(&self) {
+        self.reset_sig.wait().await
+    }
+
+    /// `(connected, session)` in one look.
+    fn session(&self) -> Result<u32, LinkError> {
+        self.state.lock(|s| {
+            let s = s.borrow();
+            if s.boot_state == 2 {
+                Ok(s.session)
+            } else {
+                Err(LinkError::NotConnected)
+            }
+        })
+    }
+
     /// Queue `data` (`[channel, ...]`) for reliable delivery, waiting for
-    /// queue room if necessary.
+    /// queue room if necessary. A packet queued before a link reset is
+    /// discarded by the sender, never sent into the new session.
     pub async fn send(&self, data: Vec<u8>) -> Result<(), LinkError> {
         if data.is_empty() || data.len() > MAX_DATA {
             return Err(LinkError::BadLength);
         }
-        if !self.connected() {
-            return Err(LinkError::NotConnected);
-        }
-        self.queue.send(data).await;
+        let session = self.session()?;
+        self.queue.send((session, data)).await;
         self.tx_wake.signal(());
         Ok(())
     }
@@ -270,11 +304,9 @@ impl Link {
         if data.is_empty() || data.len() > MAX_DATA {
             return Err(LinkError::BadLength);
         }
-        if !self.connected() {
-            return Err(LinkError::NotConnected);
-        }
+        let session = self.session()?;
         self.queue
-            .try_send(data)
+            .try_send((session, data))
             .map_err(|_| LinkError::QueueFull)?;
         self.tx_wake.signal(());
         Ok(())
@@ -313,7 +345,7 @@ impl Link {
         match proto {
             PROTO_BOOT => {
                 if payload.len() == 1 && payload[0] <= 2 {
-                    self.on_boot(payload[0]);
+                    self.on_boot(payload[0], sink);
                 }
             }
             PROTO_TRANSMISSION => {
@@ -328,7 +360,12 @@ impl Link {
                 let mut f = Vec::with_capacity(payload.len() + 1);
                 f.push(PROTO_RAW);
                 f.extend_from_slice(payload);
-                self.state.lock(|s| s.borrow_mut().raw_out.push_back(f));
+                self.state.lock(|s| {
+                    let mut s = s.borrow_mut();
+                    if s.raw_out.len() < MAX_RAW_OUT {
+                        s.raw_out.push_back(f);
+                    }
+                });
                 self.tx_wake.signal(());
             }
             _ => self.on_raw(proto, payload),
@@ -358,7 +395,7 @@ impl Link {
         }
     }
 
-    fn on_boot(&self, rx: u8) {
+    fn on_boot(&self, rx: u8, sink: &dyn PacketSink) {
         let mut became_connected = false;
         let mut reset = false;
         let mut reply = false;
@@ -387,7 +424,11 @@ impl Link {
         if reset {
             while self.queue.try_receive().is_ok() {}
             warn!("link: peer restarted the link");
-            let _ = self.events.try_send(LinkEvent::Reset);
+            sink.on_reset();
+            if self.events.try_send(LinkEvent::Reset).is_err() {
+                warn!("link: event queue full; reset not queued (latched)");
+            }
+            self.reset_sig.signal(());
             self.conn_changed.signal(());
         }
         if became_connected {
@@ -467,18 +508,20 @@ impl Link {
         let cfg = self.cfg;
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Pull new packets outside the state lock (the channel has its own).
-        let room = self.state.lock(|s| {
+        let (room, session) = self.state.lock(|s| {
             let s = s.borrow();
             if s.boot_state == 2 {
-                cfg.max_in_flight.saturating_sub(s.unacked.len())
+                (cfg.max_in_flight.saturating_sub(s.unacked.len()), s.session)
             } else {
-                0
+                (0, s.session)
             }
         });
         let mut fresh: Vec<Vec<u8>> = Vec::new();
         while fresh.len() < room {
             match self.queue.try_receive() {
-                Ok(d) => fresh.push(d),
+                // a packet queued before a reset belongs to a dead session
+                Ok((ses, d)) if ses == session => fresh.push(d),
+                Ok(_) => continue,
                 Err(_) => break,
             }
         }

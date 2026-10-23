@@ -31,9 +31,9 @@ use embassy_sync::{
     channel::Channel,
     signal::Signal,
 };
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Instant, with_timeout};
 
-use crate::fmt::{debug, info};
+use crate::fmt::{debug, info, warn};
 use crate::link::{Link, LinkError, PacketSink};
 
 type CS = CriticalSectionRawMutex;
@@ -55,6 +55,8 @@ pub enum ServiceOpenError {
     Link(LinkError),
     /// All 253 channel numbers are in use.
     NoChannel,
+    /// `recv` on a client opened with a custom handler.
+    NoQueue,
 }
 
 impl From<LinkError> for ServiceOpenError {
@@ -73,6 +75,7 @@ impl core::fmt::Display for ServiceOpenError {
             ServiceOpenError::Status(s) => write!(f, "status {s}"),
             ServiceOpenError::Link(e) => write!(f, "{e}"),
             ServiceOpenError::NoChannel => f.write_str("no free channel numbers"),
+            ServiceOpenError::NoQueue => f.write_str("client has no receive queue"),
         }
     }
 }
@@ -236,7 +239,13 @@ impl Mux {
             status,
             ch
         );
-        let _ = self.try_send(reply_ch, &[status, ch]);
+        if let Err(e) = self.try_send(reply_ch, &[status, ch]) {
+            warn!(
+                "mux: could not answer open of {:?}: {}",
+                name.as_str(),
+                crate::fmt::Debug2Format(&e)
+            );
+        }
     }
 
     // -- opening services on the peer ----------------------------------------
@@ -254,15 +263,24 @@ impl Mux {
         req.extend(name.bytes());
         let result = async {
             self.send(0, &req).await?;
-            match with_timeout(timeout, q.receive()).await {
-                Ok(Some(p)) if p.len() == 2 => match p[0] {
-                    STATUS_OK => Ok(p[1]),
-                    STATUS_OBSOLETE => Err(ServiceOpenError::Obsolete),
-                    STATUS_FAILED => Err(ServiceOpenError::Failed),
-                    STATUS_UNKNOWN => Err(ServiceOpenError::Unknown),
-                    s => Err(ServiceOpenError::Status(s)),
-                },
-                _ => Err(ServiceOpenError::Timeout),
+            // Like the console's reply handler, ignore anything that is not a
+            // two-byte reply and keep waiting until the deadline.
+            let deadline = Instant::now().checked_add(timeout).unwrap_or(Instant::MAX);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match with_timeout(left, q.receive()).await {
+                    Ok(Some(p)) if p.len() == 2 => {
+                        return match p[0] {
+                            STATUS_OK => Ok(p[1]),
+                            STATUS_OBSOLETE => Err(ServiceOpenError::Obsolete),
+                            STATUS_FAILED => Err(ServiceOpenError::Failed),
+                            STATUS_UNKNOWN => Err(ServiceOpenError::Unknown),
+                            s => Err(ServiceOpenError::Status(s)),
+                        };
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => return Err(ServiceOpenError::Timeout),
+                }
             }
         }
         .await;
@@ -275,6 +293,10 @@ impl Mux {
 }
 
 impl PacketSink for Mux {
+    fn on_reset(&self) {
+        self.reset();
+    }
+
     fn on_packet(&self, data: &[u8]) {
         let Some((&ch, payload)) = data.split_first() else {
             return;
@@ -431,10 +453,7 @@ impl ServiceClient {
 
     /// Next reply, `Ok(None)` if the peer closed the channel, `Err` on timeout.
     pub async fn recv(&self, timeout: Duration) -> Result<Option<Vec<u8>>, ServiceOpenError> {
-        let q = self
-            .queue
-            .as_ref()
-            .expect("recv on a client without a queue");
+        let q = self.queue.as_ref().ok_or(ServiceOpenError::NoQueue)?;
         with_timeout(timeout, q.receive())
             .await
             .map_err(|_| ServiceOpenError::Timeout)
@@ -444,9 +463,11 @@ impl ServiceClient {
         self.closed.load(Ordering::Acquire) || self.queue.as_ref().is_some_and(|q| q.is_closed())
     }
 
-    /// Close the peer's end and free our channel.
+    /// Close the peer's end (unless the peer already closed ours) and free
+    /// our channel.
     pub async fn close(&self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
+        let peer_closed = self.queue.as_ref().is_some_and(|q| q.is_closed());
+        if !self.closed.swap(true, Ordering::AcqRel) && !peer_closed {
             let _ = self.mux.close_remote(self.remote).await;
         }
         self.mux.free(self.local);

@@ -20,7 +20,7 @@ use core::{
 
 use embassy_futures::{
     join::{join, join3},
-    select::{Either3, select3},
+    select::{Either, Either3, select, select3},
 };
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
@@ -32,7 +32,7 @@ use embedded_io_async::{Read, Write};
 
 use crate::channels::{Mux, ServiceClient};
 use crate::fmt::{error, info, warn};
-use crate::link::{Link, LinkConfig, LinkEvent};
+use crate::link::{Link, LinkConfig};
 use crate::services::{
     self as svc, DataSetStream, DataSourceInfo, MachineMessage, MachineParameters, MessageQueue,
     Sample, SampleSink, ServiceError, UtcTime,
@@ -218,22 +218,22 @@ impl LloydPlus {
     async fn pump(&'static self) {
         let events = async {
             loop {
-                match self.link.next_event().await {
-                    LinkEvent::Connected => {}
-                    LinkEvent::Reset => {
-                        error!("machine restarted the link; connection lost");
-                        self.on_lost();
-                    }
-                }
+                // latched, so a reset is never missed (the mux itself is
+                // reset synchronously by the link)
+                self.link.wait_reset().await;
+                error!("machine restarted the link; connection lost");
+                self.on_lost();
             }
         };
         let messages = async {
             loop {
-                let m = self.internal.receive().await;
+                let m = match select(self.internal.wait_trip(), self.internal.receive()).await {
+                    Either::First(m) | Either::Second(m) => m,
+                };
                 if let Some(c) = self.current_session().and_then(|s| s.control()) {
                     c.on_machine_message(&m).await;
                 }
-                self.messages.push(m);
+                self.messages.push_user(m);
             }
         };
         join(events, messages).await;

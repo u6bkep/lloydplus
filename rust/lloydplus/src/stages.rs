@@ -370,7 +370,7 @@ impl Notify {
         timeout: Option<Duration>,
         mut pred: impl FnMut() -> bool,
     ) -> bool {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.map(|t| Instant::now().checked_add(t).unwrap_or(Instant::MAX));
         let mut rx = self.receiver();
         loop {
             if pred() {
@@ -429,7 +429,7 @@ struct ArenaState {
 }
 
 /// Keep this many recent transitions for waiters to scan.
-const RECENT: usize = 64;
+const RECENT: usize = 256;
 
 struct ArenaHandler {
     st: Mutex<CS, RefCell<ArenaState>>,
@@ -874,7 +874,8 @@ impl Core {
             } else if let Some(r) = run {
                 if r.slots().contains(&t.new) && t.new != r.base {
                     if t.new == r.base + 1 {
-                        s.hold_deadline = Some(t.at + r.drive.hold);
+                        s.hold_deadline =
+                            Some(t.at.checked_add(r.drive.hold).unwrap_or(Instant::MAX));
                         holding = Some(r);
                     } else if t.new == r.base + 2 {
                         s.hold_deadline = None;
@@ -953,6 +954,9 @@ pub struct StageControl {
     factories: BTreeMap<&'static str, ServiceClient>,
     pub missing: Vec<&'static str>,
     core: Arc<Core>,
+    /// Serializes [`start`](Self::start): bank choice, stage sends and the
+    /// flag flip must not interleave between two callers.
+    start_lock: embassy_sync::mutex::Mutex<CS, ()>,
 }
 
 impl StageControl {
@@ -1007,18 +1011,32 @@ impl StageControl {
                     return Err(e.into());
                 }
             };
-            let packets: Vec<Vec<u8>> = match name {
-                WAIT_SHARED => alloc::vec![alloc::vec![SLOT_WAIT_SHARED]],
-                WAIT_EXCLUSIVE => alloc::vec![alloc::vec![SLOT_WAIT_EXCLUSIVE]],
-                GAIN_EXCLUSIVE => alloc::vec![alloc::vec![SLOT_GAIN_EXCLUSIVE]],
-                RELEASE_EXCLUSIVE => alloc::vec![alloc::vec![SLOT_RELEASE_EXCLUSIVE]],
-                CROSSHEAD_POSITIONING => alloc::vec![
-                    motion_stage(SLOT_RETURN, max_speed, ext, 0.0, NO_SOURCE, 0.0)?,
-                    motion_stage(SLOT_RETURN_RELEASE, max_speed, ext, 0.0, NO_SOURCE, 0.0)?,
-                ],
-                DRIVE_NOWHERE => alloc::vec![alloc::vec![SLOT_STOP_A], alloc::vec![SLOT_STOP_B]],
-                ZERO_READINGS => alloc::vec![zero_readings_stage(SLOT_ZERO, sources)],
-                _ => Vec::new(),
+            let packets: Result<Vec<Vec<u8>>, StageError> = match name {
+                WAIT_SHARED => Ok(alloc::vec![alloc::vec![SLOT_WAIT_SHARED]]),
+                WAIT_EXCLUSIVE => Ok(alloc::vec![alloc::vec![SLOT_WAIT_EXCLUSIVE]]),
+                GAIN_EXCLUSIVE => Ok(alloc::vec![alloc::vec![SLOT_GAIN_EXCLUSIVE]]),
+                RELEASE_EXCLUSIVE => Ok(alloc::vec![alloc::vec![SLOT_RELEASE_EXCLUSIVE]]),
+                CROSSHEAD_POSITIONING => (|| {
+                    Ok(alloc::vec![
+                        motion_stage(SLOT_RETURN, max_speed, ext, 0.0, NO_SOURCE, 0.0)?,
+                        motion_stage(SLOT_RETURN_RELEASE, max_speed, ext, 0.0, NO_SOURCE, 0.0)?,
+                    ])
+                })(),
+                DRIVE_NOWHERE => Ok(alloc::vec![
+                    alloc::vec![SLOT_STOP_A],
+                    alloc::vec![SLOT_STOP_B]
+                ]),
+                ZERO_READINGS => Ok(alloc::vec![zero_readings_stage(SLOT_ZERO, sources)]),
+                _ => Ok(Vec::new()),
+            };
+            let packets = match packets {
+                Ok(p) => p,
+                Err(e) => {
+                    // a non-finite max speed from the parameters query
+                    svc.close().await;
+                    abort(&arena, &factories).await;
+                    return Err(e);
+                }
             };
             for p in packets {
                 if let Err(e) = svc.send(&p).await {
@@ -1067,6 +1085,7 @@ impl StageControl {
             factories,
             missing,
             core,
+            start_lock: embassy_sync::mutex::Mutex::new(()),
         })
     }
 
@@ -1076,6 +1095,7 @@ impl StageControl {
             f.close().await;
         }
         self.arena.client.close().await;
+        self.arena.lost();
         self.core.finish_all(SegmentEnd::Closed);
     }
 
@@ -1469,6 +1489,7 @@ impl StageControl {
         if let Some(n) = &next_drive {
             n.validate()?;
         }
+        let _serial = self.start_lock.lock().await;
         let b = self.core.st.lock(|s| {
             if s.borrow().bank_flag {
                 BANKS[1]
