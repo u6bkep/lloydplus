@@ -1,8 +1,8 @@
 [package]
 name = "lloydplus-host"
-version.workspace = true
-edition.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/u6bkep/lloydplus"
 description = "Host-side port adapters, CLI and simulator tests for the lloydplus driver"
 
 [[bin]]

@@ -1,8 +1,8 @@
 [package]
 name = "lloydplus"
-version.workspace = true
-edition.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/u6bkep/lloydplus"
 description = "no_std async driver for the RS-232 PC link of Lloyd Instruments 'Plus' series test frames"
 
 # Portable core: `no_std` + `alloc`, async over `embedded-io-async` byte ports
