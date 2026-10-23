@@ -57,3 +57,28 @@ def test_status_and_watchdog(pair):
     assert m.messages and m.messages[0].code == 2
     assert "Upper extension limit" in m.messages[0].description
     assert not m.lost.is_set()
+
+
+def test_pc_restart_mid_stream():
+    """A PC that power-cycles while readings stream (no close requests, just
+    BOOT 0 on the next connect) gets a fresh session: the simulator's sample
+    thread must survive the gap and serve the new session's stream."""
+    pc_port, sim_port = port_pair()
+    sim = SimMachine(sim_port)
+    sim.start()
+    try:
+        m = LloydPlus(pc_port, watchdog_interval=0.3)
+        m.connect(timeout=3)
+        assert [s for _, s in zip(range(10), m.samples(timeout=1))]
+        m._watchdog.stop()
+        m.link.stop()                       # the PC "dies" mid-stream
+        time.sleep(0.3)                     # ticks with nobody listening
+        m2 = LloydPlus(pc_port, watchdog_interval=0.3)
+        m2.connect(timeout=3)
+        got = [s for _, s in zip(range(10), m2.samples(timeout=1))]
+        assert len(got) == 10
+        assert sim.link.stats["resets"] == 1
+        assert sim._thread.is_alive()
+        m2.close()
+    finally:
+        sim.stop()

@@ -21,7 +21,7 @@ import threading
 import time
 
 from .channels import ChannelMux
-from .link import Link
+from .link import Link, LinkReset
 from .services import atof
 from . import stages as st
 
@@ -85,7 +85,7 @@ class SimMachine:
         self.version = bytes(version)
         self.descriptions = descriptions
         self.sample_period_ticks = sample_period_ticks
-        self.link = Link(port, self._on_data, name="sim")
+        self.link = Link(port, self._on_data, name="sim", on_reset=self._on_link_reset)
         self.mux = ChannelMux(self.link)
         self.status_channel: int | None = None
         self.keypad: list[int] = []
@@ -130,6 +130,24 @@ class SimMachine:
     def _on_data(self, data: bytes) -> None:
         self.mux.on_data(data)
 
+    def _on_link_reset(self) -> None:
+        """The PC restarted its link (BOOT 0 while we were connected). Every
+        channel the old session opened is gone, as on the real frame, whose
+        console re-opens its services from scratch; readings stop until the
+        new session enables them. The crosshead stays where it is."""
+        with self._lock:
+            self.mux.reset()
+            self.status_channel = None
+            self.notify_channel = None
+            self._error_ch = None
+            self._channels = []
+            self._rezero.clear()
+            self.keypad.clear()
+            self.stages.clear()
+            self.current = 0
+            self.tripped = False
+            self._install()
+
     def start(self) -> None:
         self.link.start()
         self._thread = threading.Thread(target=self._run, name="sim-machine", daemon=True)
@@ -154,8 +172,11 @@ class SimMachine:
     def _run(self) -> None:
         while not self._stop.wait(self.TICK):
             with self._lock:
-                self._step(self.TICK)
-                self._emit()
+                try:
+                    self._step(self.TICK)
+                    self._emit()
+                except LinkReset:
+                    pass        # between sessions: nothing to send to
 
     def _emit(self) -> None:
         for i, ch in enumerate(self._channels):
