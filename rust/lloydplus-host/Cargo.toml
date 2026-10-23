@@ -14,7 +14,7 @@ lloydplus = { path = "../lloydplus", features = ["std"] }
 embassy-sync = { version = "0.8", features = ["std"] }
 embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
 embassy-futures = "0.1"
-embedded-io-async = "0.6"
+embedded-io-async = "0.7"
 futures-lite = "2"
 serialport = "4"
 log = "0.4"

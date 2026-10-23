@@ -13,7 +13,7 @@ description = "no_std async driver for the RS-232 PC link of Lloyd Instruments '
 embassy-sync = "0.8"
 embassy-time = "0.5"
 embassy-futures = "0.1"
-embedded-io-async = "0.6"
+embedded-io-async = "0.7"
 heapless = { version = "0.9", default-features = false }
 
 defmt = { version = "1.0", optional = true }
