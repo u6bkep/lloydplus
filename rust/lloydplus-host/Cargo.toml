@@ -1,0 +1,21 @@
+[package]
+name = "lloydplus-host"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Host-side port adapters, CLI and simulator tests for the lloydplus driver"
+
+[[bin]]
+name = "lloydplus-host"
+path = "src/main.rs"
+
+[dependencies]
+lloydplus = { path = "../lloydplus", features = ["std"] }
+embassy-sync = { version = "0.8", features = ["std"] }
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+embassy-futures = "0.1"
+embedded-io-async = "0.6"
+futures-lite = "2"
+serialport = "4"
+log = "0.4"
+env_logger = "0.11"

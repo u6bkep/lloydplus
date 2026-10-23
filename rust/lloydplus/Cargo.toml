@@ -1,0 +1,36 @@
+[package]
+name = "lloydplus"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "no_std async driver for the RS-232 PC link of Lloyd Instruments 'Plus' series test frames"
+
+# Portable core: `no_std` + `alloc`, async over `embedded-io-async` byte ports
+# and `embassy-time`/`embassy-sync`, so the same code runs under embassy on a
+# microcontroller and under any executor on a host (see `lloydplus-host`).
+
+[dependencies]
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embassy-futures = "0.1"
+embedded-io-async = "0.6"
+heapless = { version = "0.9", default-features = false }
+
+defmt = { version = "1.0", optional = true }
+log = { version = "0.4", optional = true }
+critical-section = { version = "1.2", optional = true }
+
+[features]
+default = []
+# Host build: std time driver, std critical section, `log` logging.
+std = [
+    "embassy-time/std",
+    "embassy-time/generic-queue-8",
+    "embassy-sync/std",
+    "dep:critical-section",
+    "critical-section/std",
+    "dep:log",
+]
+# Firmware logging (mutually exclusive with `log`).
+defmt = ["dep:defmt", "embassy-sync/defmt", "embassy-time/defmt", "heapless/defmt"]
+log = ["dep:log"]

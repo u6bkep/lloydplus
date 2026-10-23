@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["rust/lloydplus", "rust/lloydplus-host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/u6bkep/lloydplus"

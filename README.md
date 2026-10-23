@@ -159,6 +159,29 @@ with LloydPlus("/dev/ttyUSB0") as m:
 How this maps onto the wire, and where it differs from the original console, is in
 PROTOCOL.md §11.
 
+## Rust crate
+
+`rust/lloydplus` is a port of the driver to `no_std` async Rust, layer for layer
+(framing, link, channels, services, stages, machine), for the controller that will sit
+on the frame's serial port. Byte ports are `embedded-io-async` readers and writers,
+time is `embassy-time`, shared state is `embassy-sync`, so the same code runs under
+embassy on an RP2350 and under any executor on a host. `rust/lloydplus-host` adds the
+host adapters (a serial port with hardware flow control, or a TCP socket), a small CLI
+with `info`, `log` and `move`, and integration tests that drive the Rust crate against
+the Python simulator served over TCP:
+
+```
+uv run python -m lloydplus.simserver --port 4321 --forever     # the simulator, as a machine on TCP
+cargo run -p lloydplus-host -- info --port 127.0.0.1:4321
+cargo run -p lloydplus-host -- move --port /dev/ttyUSB0 --to 10 --speed 50
+cargo test                                                      # unit tests + the simulator tests (needs uv)
+```
+
+Status: every layer passes the same simulator scenarios as the Python driver (connect,
+information, 1 kHz readings, take and release control, drives, holds, next-drive
+chaining, pre-emption, stop, zero, return to zero, grip-protection trip and recovery).
+Not yet run against the frame; the Python driver remains the hardware-verified reference.
+
 ## Layout
 
 | module | contents |
