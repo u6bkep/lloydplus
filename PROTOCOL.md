@@ -500,6 +500,11 @@ Code: 0x429e00, timer handler 0x429f00, reply handler 0x429fe0, send path 0x423c
   normal session the PC's acknowledgements of the 1 kHz stream keep the link busy; a
   client that does not subscribe to readings must still send something within that
   window. `lloydplus` therefore pings every 2 s instead of the console's 10 s.
+* **A running stage stops with the session (verified 2026-10-23).** With a 10 mm/min
+  drive under way, the PC process was killed outright; on reconnecting 8 s later the
+  crosshead was stationary about 0.35 mm (some 2 s of travel) past where it had been at
+  the kill, and stayed put. So the `comm1 reset` also halts motion: a PC or controller
+  that dies mid-test leaves the frame moving for at most the ~4 s timeout.
 
 ### 8.3 `NotImplementedDataSources`
 
