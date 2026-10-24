@@ -501,6 +501,10 @@ impl Sample {
 /// Where decoded samples go. Called from the link's receive context.
 pub trait SampleSink: Send + Sync {
     fn sample(&self, s: Sample);
+    /// The source was zeroed (by anyone: a PC command or the keypad's ZERO).
+    /// `value_before` is the reading, in units, the instant before: the new
+    /// zero's position in the old coordinates.
+    fn zeroed(&self, _source: u8, _value_before: f64) {}
 }
 
 struct DecState {
@@ -548,12 +552,14 @@ impl SourceDecoder {
     }
 
     /// Decode one packet into samples (pure; no sink calls).
-    fn decode(&self, p: &[u8], out: &mut Vec<Sample>) {
+    /// Returns the reading before a zero when the packet was one.
+    fn decode(&self, p: &[u8], out: &mut Vec<Sample>) -> Option<f64> {
         let Some((&kind, d)) = p.split_first() else {
-            return;
+            return None;
         };
         self.st.lock(|s| {
             let mut s = s.borrow_mut();
+            let mut zeroed = None;
             match kind {
                 0 => {
                     for pair in d.chunks_exact(2) {
@@ -576,6 +582,7 @@ impl SourceDecoder {
                         .wrapping_add(i32::from_be_bytes([d[0], d[1], d[2], d[3]]) as i64);
                 }
                 2 if d.len() == 4 => {
+                    zeroed = Some(s.accum as f64 * s.scale);
                     s.accum = 0;
                     s.zero_offset = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
                 }
@@ -603,16 +610,20 @@ impl SourceDecoder {
                     );
                 }
             }
-        });
+            zeroed
+        })
     }
 }
 
 impl Handler for SourceDecoder {
     fn on_packet(&self, _mux: &Mux, payload: &[u8]) {
         let mut out = Vec::with_capacity(payload.len() / 2);
-        self.decode(payload, &mut out);
+        let zeroed = self.decode(payload, &mut out);
         for s in out {
             self.sink.sample(s);
+        }
+        if let Some(before) = zeroed {
+            self.sink.zeroed(self.index, before);
         }
     }
 }

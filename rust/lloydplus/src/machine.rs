@@ -172,6 +172,13 @@ impl SampleSink for Sink {
             self.0.sample_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn zeroed(&self, source: u8, value_before: f64) {
+        let tap = self.0.tap.lock(|t| t.borrow().clone());
+        if let Some(t) = tap {
+            t.zeroed(source, value_before);
+        }
+    }
 }
 
 impl LloydPlus {
